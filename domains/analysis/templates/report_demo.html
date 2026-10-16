@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>销售数据分析 2024 — 数据分析报告</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<style>
+:root {
+  --bg: #0f1117;
+  --bg2: #1a1d27;
+  --bg3: #23263a;
+  --border: rgba(255,255,255,0.08);
+  --border2: rgba(255,255,255,0.14);
+  --text: #e8eaf0;
+  --text2: #9096b0;
+  --text3: #5a6080;
+  --blue: #4f8ef7;
+  --blue-bg: rgba(79,142,247,0.12);
+  --green: #34c77b;
+  --green-bg: rgba(52,199,123,0.12);
+  --amber: #f5a623;
+  --amber-bg: rgba(245,166,35,0.12);
+  --red: #f55151;
+  --red-bg: rgba(245,81,81,0.12);
+  --purple: #a78bfa;
+  --purple-bg: rgba(167,139,250,0.12);
+  --radius: 10px;
+  --radius-lg: 14px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system,'PingFang SC','Microsoft YaHei',sans-serif; font-size: 14px; line-height: 1.6; min-height: 100vh; }
+.app { display: flex; min-height: 100vh; }
+.sidebar { width: 220px; background: var(--bg2); border-right: 1px solid var(--border); padding: 24px 0; position: sticky; top: 0; height: 100vh; overflow-y: auto; flex-shrink: 0; }
+.sidebar-logo { padding: 0 20px 20px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.sidebar-logo .title { font-size: 15px; font-weight: 500; color: var(--text); }
+.sidebar-logo .subtitle { font-size: 12px; color: var(--text3); margin-top: 2px; }
+.sidebar-section { padding: 0 12px; margin-bottom: 8px; }
+.sidebar-section-label { font-size: 11px; color: var(--text3); font-weight: 500; padding: 0 8px 6px; letter-spacing: 0.05em; }
+.nav-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; cursor: pointer; color: var(--text2); font-size: 13px; transition: background 0.15s, color 0.15s; margin-bottom: 2px; }
+.nav-item:hover { background: var(--bg3); color: var(--text); }
+.nav-item.active { background: var(--blue-bg); color: var(--blue); }
+.nav-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: 0.7; flex-shrink: 0; }
+.main { flex: 1; overflow-y: auto; }
+.page { display: none; padding: 32px 36px; }
+.page.active { display: block; }
+.page-header { margin-bottom: 28px; }
+.page-header h1 { font-size: 22px; font-weight: 500; color: var(--text); }
+.page-header .meta { font-size: 12px; color: var(--text3); margin-top: 6px; display: flex; align-items: center; gap: 16px; }
+.page-header .tag { background: var(--blue-bg); color: var(--blue); padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-bottom: 28px; }
+.kpi-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; position: relative; overflow: hidden; }
+.kpi-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; }
+.kpi-card.blue::before { background: var(--blue); }
+.kpi-card.green::before { background: var(--green); }
+.kpi-card.amber::before { background: var(--amber); }
+.kpi-card.red::before { background: var(--red); }
+.kpi-card.purple::before { background: var(--purple); }
+.kpi-label { font-size: 12px; color: var(--text3); margin-bottom: 6px; }
+.kpi-value { font-size: 26px; font-weight: 500; color: var(--text); line-height: 1.2; }
+.kpi-change { font-size: 12px; margin-top: 6px; display: flex; align-items: center; gap: 4px; }
+.kpi-change.up { color: var(--green); }
+.kpi-change.down { color: var(--red); }
+.kpi-change.neutral { color: var(--text3); }
+.kpi-sub { font-size: 11px; color: var(--text3); margin-top: 4px; }
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-lg); margin-bottom: 20px; overflow: hidden; }
+.card-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.card-header h2 { font-size: 14px; font-weight: 500; color: var(--text); }
+.card-header .badge { font-size: 11px; padding: 2px 8px; border-radius: 4px; background: var(--bg3); color: var(--text2); }
+.card-body { padding: 20px; }
+.chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+.chart-row.thirds { grid-template-columns: 2fr 1fr; }
+.chart-container { height: 280px; }
+.chart-container.tall { height: 340px; }
+.conclusion { background: var(--bg3); border-left: 3px solid var(--blue); border-radius: 0 8px 8px 0; padding: 14px 16px; margin: 16px 0; font-size: 13px; color: var(--text2); line-height: 1.7; }
+.conclusion strong { color: var(--text); }
+.findings { list-style: none; margin: 12px 0; }
+.findings li { padding: 8px 0 8px 20px; position: relative; font-size: 13px; color: var(--text2); border-bottom: 1px solid var(--border); line-height: 1.6; }
+.findings li:last-child { border-bottom: none; }
+.findings li::before { content: ''; position: absolute; left: 0; top: 17px; width: 6px; height: 6px; border-radius: 50%; background: var(--blue); }
+.findings li strong { color: var(--text); }
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th { background: var(--bg3); padding: 10px 14px; text-align: left; font-weight: 500; color: var(--text2); font-size: 12px; border-bottom: 1px solid var(--border2); white-space: nowrap; }
+.data-table td { padding: 9px 14px; border-bottom: 1px solid var(--border); color: var(--text2); }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:hover td { background: rgba(255,255,255,0.02); }
+.data-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.data-table .up { color: var(--green); }
+.data-table .down { color: var(--red); }
+.badge-status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+.badge-status.good { background: var(--green-bg); color: var(--green); }
+.badge-status.warn { background: var(--amber-bg); color: var(--amber); }
+.badge-status.bad { background: var(--red-bg); color: var(--red); }
+.caveat { background: var(--amber-bg); border: 1px solid rgba(245,166,35,0.2); border-radius: var(--radius); padding: 14px 16px; margin: 16px 0; font-size: 13px; color: var(--amber); }
+.caveat strong { display: block; margin-bottom: 6px; font-size: 12px; letter-spacing: 0.03em; }
+.caveat ul { padding-left: 16px; }
+.caveat li { margin-bottom: 4px; color: rgba(245,166,35,0.85); }
+.summary-block { background: rgba(79,142,247,0.06); border: 1px solid rgba(79,142,247,0.2); border-radius: var(--radius-lg); padding: 24px 28px; margin-bottom: 20px; }
+.summary-block h3 { font-size: 16px; font-weight: 500; margin-bottom: 12px; color: var(--text); }
+.summary-block p { font-size: 14px; color: var(--text2); line-height: 1.8; }
+.rec-list { list-style: none; }
+.rec-list li { display: flex; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); align-items: flex-start; }
+.rec-list li:last-child { border-bottom: none; }
+.rec-num { width: 24px; height: 24px; border-radius: 50%; background: var(--blue-bg); color: var(--blue); font-size: 12px; font-weight: 500; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.rec-text { font-size: 13px; color: var(--text2); line-height: 1.6; }
+.rec-text strong { color: var(--text); display: block; margin-bottom: 2px; }
+.anomaly-list { list-style: none; }
+.anomaly-list li { padding: 10px 14px; background: var(--red-bg); border: 1px solid rgba(245,81,81,0.15); border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: rgba(245,81,81,0.9); }
+@media (max-width: 900px) { .sidebar{display:none;} .chart-row{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="app">
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="title">销售数据分析 2024</div>
+    <div class="subtitle">2026-05-17 22:15</div>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-label">总览</div>
+    <div class="nav-item active" onclick="showPage('overview',this)"><span class="nav-dot"></span>执行摘要</div>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-label">数据分析</div>
+    <div class="nav-item" onclick="showPage('ch0',this)"><span class="nav-dot"></span>销售趋势分析</div>
+    <div class="nav-item" onclick="showPage('ch1',this)"><span class="nav-dot"></span>渠道对比分析</div>
+    <div class="nav-item" onclick="showPage('ch2',this)"><span class="nav-dot"></span>产品结构分析</div>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-section-label">报告</div>
+    <div class="nav-item" onclick="showPage('summary',this)"><span class="nav-dot"></span>总结与建议</div>
+    <div class="nav-item" onclick="showPage('data_note',this)"><span class="nav-dot"></span>数据说明</div>
+  </div>
+</nav>
+
+<main class="main">
+
+<!-- 执行摘要 -->
+<div class="page active" id="page-overview">
+  <div class="page-header">
+    <h1>执行摘要</h1>
+    <div class="meta">
+      <span>文件：sales_2024.xlsx</span>
+      <span>分析时间：2026-05-17 22:15:44</span>
+      <span class="tag">3 个数据表</span>
+    </div>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi-card blue"><div class="kpi-label">全年总销售额</div><div class="kpi-value">2,847万</div><div class="kpi-change up">↑ 同比+18.3%</div><div class="kpi-sub">vs 2023年 2,406万</div></div>
+    <div class="kpi-card green"><div class="kpi-label">订单总量</div><div class="kpi-value">38,620</div><div class="kpi-change up">↑ 同比+12.1%</div><div class="kpi-sub">日均 105.8 单</div></div>
+    <div class="kpi-card amber"><div class="kpi-label">客单价</div><div class="kpi-value">¥737</div><div class="kpi-change up">↑ 同比+5.5%</div><div class="kpi-sub">中位数 ¥520</div></div>
+    <div class="kpi-card red"><div class="kpi-label">退款率</div><div class="kpi-value">4.2%</div><div class="kpi-change down">↑ 同比+0.8pt</div><div class="kpi-sub">需重点关注</div></div>
+    <div class="kpi-card purple"><div class="kpi-label">线上渠道占比</div><div class="kpi-value">68%</div><div class="kpi-change up">↑ 同比+6pt</div><div class="kpi-sub">线下 32%</div></div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>核心结论</h2><span class="badge">AI 分析</span></div>
+    <div class="card-body">
+      <div class="conclusion">
+        2024年全年销售额达 <strong>2,847万元</strong>，同比增长 <strong>18.3%</strong>，增长势头良好。线上渠道持续扩张，占比从62%提升至68%。Q3表现最强（环比+22%），Q4略有回落但仍高于去年同期。退款率小幅上升至4.2%，需关注退款集中的产品品类。
+      </div>
+      <ul class="findings">
+        <li><strong>Q3 爆发式增长：</strong>三季度销售额达 892万，为全年最高季度，与当期促销活动强相关</li>
+        <li><strong>线上渠道超预期：</strong>电商平台销售占比首次突破65%，APP渠道增速达34%</li>
+        <li><strong>高客单价产品拉动：</strong>¥1000以上产品销售额同比增长41%，结构升级明显</li>
+        <li><strong>退款预警：</strong>电子配件类退款率达9.1%，远超均值，建议排查质量问题</li>
+      </ul>
+    </div>
+  </div>
+  <div class="chart-row">
+    <div class="card">
+      <div class="card-header"><h2>月度销售额趋势</h2></div>
+      <div class="card-body"><div class="chart-container" id="c-trend"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h2>渠道销售占比</h2></div>
+      <div class="card-body"><div class="chart-container" id="c-pie"></div></div>
+    </div>
+  </div>
+</div>
+
+<!-- 章节1：销售趋势 -->
+<div class="page" id="page-ch0">
+  <div class="page-header">
+    <h1>销售趋势分析</h1>
+    <div class="meta"><span>Sheet: 月度销售</span><span class="tag">时间序列</span></div>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi-card blue"><div class="kpi-label">Q1 销售额</div><div class="kpi-value">578万</div><div class="kpi-change up">↑ +9.2%</div></div>
+    <div class="kpi-card green"><div class="kpi-label">Q2 销售额</div><div class="kpi-value">685万</div><div class="kpi-change up">↑ +15.7%</div></div>
+    <div class="kpi-card amber"><div class="kpi-label">Q3 销售额</div><div class="kpi-value">892万</div><div class="kpi-change up">↑ +22.3%</div></div>
+    <div class="kpi-card purple"><div class="kpi-label">Q4 销售额</div><div class="kpi-value">692万</div><div class="kpi-change down">↓ -4.1%</div></div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>月度趋势对比（2023 vs 2024）</h2></div>
+    <div class="card-body"><div class="chart-container tall" id="c-monthly-compare"></div></div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>分析发现</h2></div>
+    <div class="card-body">
+      <ul class="findings">
+        <li><strong>明显季节性规律：</strong>每年7-9月为销售高峰，与行业大促节点高度一致（618、暑期、开学季）</li>
+        <li><strong>Q4 回落非异常：</strong>Q4同比去年仍增长12%，环比下降主要因Q3促销提前透支需求</li>
+        <li><strong>增速趋势健康：</strong>剔除Q3大促因素，月均自然增长约8%，与公司战略目标匹配</li>
+      </ul>
+      <div class="conclusion">
+        2024年销售节奏呈现"前稳、中爆、后收"格局，<strong>Q3的高增长具有可持续性但依赖促销驱动</strong>，建议2025年布局更均衡的全年促销节奏，减少Q4的相对低谷效应。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 章节2：渠道对比 -->
+<div class="page" id="page-ch1">
+  <div class="page-header">
+    <h1>渠道对比分析</h1>
+    <div class="meta"><span>Sheet: 渠道数据</span><span class="tag">多维对比</span></div>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi-card blue"><div class="kpi-label">官网直销</div><div class="kpi-value">28.3%</div><div class="kpi-change up">↑ +3pt</div></div>
+    <div class="kpi-card green"><div class="kpi-label">电商平台</div><div class="kpi-value">39.7%</div><div class="kpi-change up">↑ +3pt</div></div>
+    <div class="kpi-card amber"><div class="kpi-label">线下门店</div><div class="kpi-value">23.8%</div><div class="kpi-change down">↓ -5pt</div></div>
+    <div class="kpi-card purple"><div class="kpi-label">分销代理</div><div class="kpi-value">8.2%</div><div class="kpi-change down">↓ -1pt</div></div>
+  </div>
+  <div class="chart-row thirds">
+    <div class="card">
+      <div class="card-header"><h2>各渠道月度销售额</h2></div>
+      <div class="card-body"><div class="chart-container" id="c-channel-bar"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h2>渠道客单价对比</h2></div>
+      <div class="card-body"><div class="chart-container" id="c-channel-arpu"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>各渠道核心指标</h2></div>
+    <div class="card-body">
+      <table class="data-table">
+        <thead><tr><th>渠道</th><th class="num">销售额(万)</th><th class="num">订单量</th><th class="num">客单价</th><th class="num">退款率</th><th class="num">同比增速</th></tr></thead>
+        <tbody>
+          <tr><td>官网直销</td><td class="num">805.7</td><td class="num">9,840</td><td class="num">¥819</td><td class="num">3.1%</td><td class="num up">+23.4%</td></tr>
+          <tr><td>电商平台</td><td class="num">1,130.2</td><td class="num">18,320</td><td class="num">¥617</td><td class="num">5.2%</td><td class="num up">+31.8%</td></tr>
+          <tr><td>线下门店</td><td class="num">677.6</td><td class="num">7,210</td><td class="num">¥940</td><td class="num">2.4%</td><td class="num up">+3.1%</td></tr>
+          <tr><td>分销代理</td><td class="num">233.5</td><td class="num">3,250</td><td class="num">¥718</td><td class="num">3.8%</td><td class="num down">-2.1%</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 章节3：产品结构 -->
+<div class="page" id="page-ch2">
+  <div class="page-header">
+    <h1>产品结构分析</h1>
+    <div class="meta"><span>Sheet: 产品明细</span><span class="tag">品类分析</span></div>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi-card blue"><div class="kpi-label">SKU 总数</div><div class="kpi-value">1,284</div><div class="kpi-change neutral">— 新增142个</div></div>
+    <div class="kpi-card green"><div class="kpi-label">Top 20 贡献率</div><div class="kpi-value">67%</div><div class="kpi-change up">↑ 集中度提升</div></div>
+    <div class="kpi-card amber"><div class="kpi-label">高价位段占比</div><div class="kpi-value">34%</div><div class="kpi-change up">↑ +8pt</div></div>
+    <div class="kpi-card red"><div class="kpi-label">滞销 SKU</div><div class="kpi-value">213</div><div class="kpi-change neutral">占总SKU 16.6%</div></div>
+  </div>
+  <div class="chart-row">
+    <div class="card">
+      <div class="card-header"><h2>品类销售额分布</h2></div>
+      <div class="card-body"><div class="chart-container" id="c-category-pie"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-header"><h2>价格段销售额对比</h2></div>
+      <div class="card-body"><div class="chart-container" id="c-price-bar"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>异常发现</h2></div>
+    <div class="card-body">
+      <ul class="anomaly-list">
+        <li>电子配件类退款率 9.1%，远超均值 4.2%，涉及订单 1,840笔，建议排查质量问题</li>
+        <li>生活用品类 Q4 销量环比骤降 38%，与竞品大促重合，需监测竞争态势</li>
+      </ul>
+      <div class="conclusion" style="margin-top:16px">
+        产品结构呈现<strong>明显的"二八效应"</strong>，Top20 SKU贡献67%收入，说明核心产品竞争力强。高价位段快速增长（+41%）印证消费升级趋势，建议继续加大旗舰产品资源投入，同时对213个滞销SKU制定清理计划。
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 总结 -->
+<div class="page" id="page-summary">
+  <div class="page-header">
+    <h1>总结与建议</h1>
+    <div class="meta"><span>基于本次数据分析</span></div>
+  </div>
+  <div class="summary-block">
+    <h3>总体结论</h3>
+    <p>2024年全年销售表现优于预期，在宏观环境承压的背景下实现18.3%的增长，核心驱动力来自线上渠道扩张和高价位产品结构升级。公司整体呈健康增长态势，季节性节奏明显，Q3大促期间表现尤为突出。需要重点关注的问题是：①电子配件退款率偏高；②线下渠道增速趋缓；③分销代理渠道出现首次负增长，需评估渠道价值。数据分析结论基于2024年1-12月已成交订单，预估数据（Q4部分）的精确度可能低于前三季度。</p>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>行动建议</h2></div>
+    <div class="card-body">
+      <ol class="rec-list">
+        <li><span class="rec-num">1</span><span class="rec-text"><strong>紧急：排查电子配件退款问题</strong>针对退款率9.1%的电子配件品类，建议立即启动质量复盘，重点检查近6个月新增SKU，排查供应商质量问题</span></li>
+        <li><span class="rec-num">2</span><span class="rec-text"><strong>战略：均衡全年销售节奏</strong>设计全年12个节点的轻量级促销方案，避免Q3促销过度透支Q4需求，目标将Q4同比提升至15%以上</span></li>
+        <li><span class="rec-num">3</span><span class="rec-text"><strong>增长：加速线上渠道投入</strong>APP渠道增速34%最高，建议2025年加大APP用户运营预算，目标实现APP渠道占比从当前12%提升至18%</span></li>
+        <li><span class="rec-num">4</span><span class="rec-text"><strong>效率：清理滞销SKU</strong>对213个全年零销售SKU制定6个月清仓计划，释放库存资金，优化SKU结构</span></li>
+      </ol>
+    </div>
+  </div>
+</div>
+
+<!-- 数据说明 -->
+<div class="page" id="page-data_note">
+  <div class="page-header">
+    <h1>数据说明</h1>
+    <div class="meta"><span>了解数据范围与局限性，避免误读结论</span></div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>数据背景（用户提供）</h2></div>
+    <div class="card-body">
+      <div class="conclusion" style="border-color:var(--green)">
+        <pre style="white-space:pre-wrap;font-family:inherit;font-size:13px;">数据时间范围：2024年1月1日～2024年12月31日
+数据来源：ERP系统导出，仅含已成交订单（已付款状态），不含询价/取消订单
+金额单位：元（人民币）
+特殊说明：
+- Q4（10-12月）部分数据为系统预估值，精确度低于前三季度
+- "渠道"字段：1=官网，2=电商平台，3=线下门店，4=分销代理
+- 测试账号已过滤（用户名含"test"或"测试"的记录）
+- 跨境订单（币种非CNY）已按当日汇率换算</pre>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>数据局限性（AI 标注）</h2></div>
+    <div class="card-body">
+      <div class="caveat">
+        <strong>注意：以下结论受数据范围约束，解读时请知悉</strong>
+        <ul>
+          <li>Q4数据含预估成分，环比/同比结论仅供参考，建议实际数据确认后再做决策</li>
+          <li>退款数据仅反映已发起退款的订单，未申请退款但实际满意度低的情况无法识别</li>
+          <li>分析结论基于"已成交订单"，不含流失用户和未成交询价，转化率相关结论需结合漏斗数据</li>
+          <li>跨境订单汇率换算可能存在±2%的误差，影响国际业务相关指标</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h2>各 Sheet 数据概况</h2></div>
+    <div class="card-body">
+      <table class="data-table">
+        <thead><tr><th>Sheet 名称</th><th class="num">行数</th><th class="num">列数</th><th class="num">缺失值率</th><th>关键字段</th><th>质量评估</th></tr></thead>
+        <tbody>
+          <tr><td>月度销售</td><td class="num">12</td><td class="num">8</td><td class="num">0.0%</td><td>月份、销售额、订单量、同比</td><td><span class="badge-status good">良好</span></td></tr>
+          <tr><td>渠道数据</td><td class="num">4,820</td><td class="num">12</td><td class="num">3.2%</td><td>渠道ID、金额、日期、退款</td><td><span class="badge-status good">良好</span></td></tr>
+          <tr><td>产品明细</td><td class="num">38,620</td><td class="num">18</td><td class="num">8.7%</td><td>SKU、品类、价格、数量</td><td><span class="badge-status warn">注意</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+</main>
+</div>
+
+<script>
+function showPage(id,el){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
+  const page=document.getElementById('page-'+id);
+  if(page)page.classList.add('active');
+  if(el)el.classList.add('active');
+  setTimeout(()=>window.dispatchEvent(new Event('resize')),60);
+}
+const C=['#4f8ef7','#34c77b','#f5a623','#a78bfa','#f55151','#38bdf8'];
+const BASE={backgroundColor:'transparent',textStyle:{color:'#9096b0',fontFamily:'inherit',fontSize:12},tooltip:{backgroundColor:'#1a1d27',borderColor:'rgba(255,255,255,0.1)',textStyle:{color:'#e8eaf0'}},grid:{left:8,right:16,top:20,bottom:40,containLabel:true}};
+function mc(id,opt){
+  const el=document.getElementById(id);
+  if(!el)return;
+  const ch=echarts.init(el,null,{renderer:'canvas'});
+  ch.setOption(Object.assign({},BASE,opt));
+  window.addEventListener('resize',()=>ch.resize());
+}
+const months=['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+mc('c-trend',{xAxis:{type:'category',data:months,axisLine:{lineStyle:{color:'#3a3e52'}}},yAxis:{type:'value',name:'万元',splitLine:{lineStyle:{color:'#23263a'}}},series:[{name:'2024',type:'line',data:[185,162,231,198,245,242,268,312,312,238,208,246],smooth:true,symbolSize:4,lineStyle:{color:C[0],width:2},itemStyle:{color:C[0]},areaStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(79,142,247,0.18)'},{offset:1,color:'rgba(79,142,247,0)'}]}}},{name:'2023',type:'line',data:[162,145,198,172,208,201,225,248,258,218,196,175],smooth:true,symbolSize:4,lineStyle:{color:C[1],width:2,type:'dashed'},itemStyle:{color:C[1]}}],legend:{data:['2024','2023'],bottom:0,textStyle:{color:'#9096b0',fontSize:11}},tooltip:{trigger:'axis'}});
+mc('c-pie',{series:[{type:'pie',radius:['38%','65%'],data:[{value:805,name:'官网直销',itemStyle:{color:C[0]}},{value:1130,name:'电商平台',itemStyle:{color:C[1]}},{value:678,name:'线下门店',itemStyle:{color:C[2]}},{value:234,name:'分销代理',itemStyle:{color:C[3]}}],label:{color:'#9096b0',fontSize:11}}],legend:{bottom:0,textStyle:{color:'#9096b0',fontSize:11}},tooltip:{trigger:'item',formatter:'{b}: {c}万 ({d}%)'}});
+mc('c-monthly-compare',{xAxis:{type:'category',data:months,axisLine:{lineStyle:{color:'#3a3e52'}}},yAxis:{type:'value',name:'万元',splitLine:{lineStyle:{color:'#23263a'}}},series:[{name:'2024',type:'bar',data:[185,162,231,198,245,242,268,312,312,238,208,246],itemStyle:{color:C[0],borderRadius:[3,3,0,0]},barMaxWidth:28},{name:'2023',type:'bar',data:[162,145,198,172,208,201,225,248,258,218,196,175],itemStyle:{color:C[1],borderRadius:[3,3,0,0]},barMaxWidth:28}],legend:{data:['2024','2023'],bottom:0,textStyle:{color:'#9096b0',fontSize:11}},tooltip:{trigger:'axis'}});
+mc('c-channel-bar',{xAxis:{type:'category',data:months,axisLine:{lineStyle:{color:'#3a3e52'}}},yAxis:{type:'value',splitLine:{lineStyle:{color:'#23263a'}}},series:[{name:'官网',type:'bar',stack:'a',data:[62,54,77,66,82,81,89,104,104,79,69,82],itemStyle:{color:C[0]},barMaxWidth:32},{name:'电商',type:'bar',stack:'a',data:[75,64,92,78,97,95,106,124,123,94,82,100],itemStyle:{color:C[1]}},{name:'线下',type:'bar',stack:'a',data:[38,34,46,39,48,47,52,60,61,46,40,46],itemStyle:{color:C[2]}},{name:'分销',type:'bar',stack:'a',data:[10,10,16,15,18,19,21,24,24,19,17,18],itemStyle:{color:C[3]}}],legend:{bottom:0,textStyle:{color:'#9096b0',fontSize:11}},tooltip:{trigger:'axis',axisPointer:{type:'shadow'}}});
+mc('c-channel-arpu',{xAxis:{type:'category',data:['官网','电商','线下','分销'],axisLine:{lineStyle:{color:'#3a3e52'}}},yAxis:{type:'value',name:'元',splitLine:{lineStyle:{color:'#23263a'}}},series:[{type:'bar',data:[{value:819,itemStyle:{color:C[0]}},{value:617,itemStyle:{color:C[1]}},{value:940,itemStyle:{color:C[2]}},{value:718,itemStyle:{color:C[3]}}],barMaxWidth:48,itemStyle:{borderRadius:[4,4,0,0]},label:{show:true,position:'top',color:'#9096b0',fontSize:11}}],tooltip:{trigger:'axis'}});
+mc('c-category-pie',{series:[{type:'pie',radius:['35%','62%'],data:[{value:1140,name:'智能家居',itemStyle:{color:C[0]}},{value:854,name:'电子配件',itemStyle:{color:C[1]}},{value:512,name:'生活用品',itemStyle:{color:C[2]}},{value:341,name:'服装鞋帽',itemStyle:{color:C[3]}},],label:{color:'#9096b0',fontSize:11}}],legend:{bottom:0,textStyle:{color:'#9096b0',fontSize:11}},tooltip:{trigger:'item',formatter:'{b}: {c}万 ({d}%)'}});
+mc('c-price-bar',{xAxis:{type:'category',data:['<¥100','¥100-500','¥500-1000','>¥1000'],axisLine:{lineStyle:{color:'#3a3e52'}}},yAxis:{type:'value',name:'万元',splitLine:{lineStyle:{color:'#23263a'}}},series:[{name:'2023',type:'bar',data:[186,812,893,515],itemStyle:{color:C[1],borderRadius:[3,3,0,0]},barMaxWidth:32},{name:'2024',type:'bar',data:[172,894,1012,769],itemStyle:{color:C[0],borderRadius:[3,3,0,0]},barMaxWidth:32}],legend:{data:['2023','2024'],bottom:0,textStyle:{color:'#9096b0',fontSize:11}},tooltip:{trigger:'axis',axisPointer:{type:'shadow'}}});
+</script>
+</body>
+</html>
