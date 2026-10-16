@@ -20,7 +20,7 @@ from typing import Literal
 Theme = Literal["light", "dark"]
 
 FONT_FAMILY = (
-    '"SF Pro Text", "PingFang SC", "Microsoft YaHei", '
+    '"PingFang SC", "Helvetica Neue", "Microsoft YaHei", '
     'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 )
 

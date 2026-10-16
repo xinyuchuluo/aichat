@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""AIChatStudio — 入口。
+"""AIChatStudio — 一体化 App 入口。
 
-当前阶段：先让原 AIChat（domains/chat/）跑起来，验证迁移路径正确。
-后续接入 shell/main_window 一体化壳 + 其他 4 个域。
+启动流程：
+1. 加载工作区（首次启动自动创建 ~/AichatStudio/default）
+2. 初始化内核单例（config_vault / llm_client / prompt_repo）
+3. 加载域清单（domains/<name>/__init__.py 里 register_domain）
+4. 显示 shell.main_window.MainWindow（侧边栏列启用域，浅色主题）
+
+当前阶段：chat 域已接入新壳；novel/studio/warehouse/analysis 待迁
 """
 import os
 import sys
@@ -19,38 +24,62 @@ def main() -> int:
         return 1
 
     try:
-        from domains.chat.config import Config
-        from domains.chat.memory.engine import MemoryEngine
-        from domains.chat.session.session import SessionManager
-        from domains.chat.widgets.main_window import MainWindow
-        from domains.chat.widgets.styles import apply_skin
+        from core import workspace as ws_mod
+        from core import config_vault
+        from core import llm_client
+        from core import prompt_repo
+        from shell import styles
+        from shell.main_window import MainWindow, load_domains
     except ImportError as e:
-        print(f"导入错误：{e}")
+        print(f"内核加载错误：{e}")
         traceback.print_exc()
         return 1
 
     app = QApplication(sys.argv)
     app.setApplicationName("AIChatStudio")
+    app.setOrganizationName("AichatStudio")
 
-    # 加载配置（沿用原 AIChat 的 Config，不动）
-    config = Config.load()
-    config.save()
+    # 浅色主题（默认）
+    styles.apply_theme(app, "light")
 
-    # 初始化核心组件
-    memory = MemoryEngine(config.data_dir)
-    memory.set_summarize_threshold(config.summarize_threshold)
-    sessions = SessionManager(config.data_dir)
+    # 工作区：首次启动创建 default
+    try:
+        ws = ws_mod.ensure_default()
+    except Exception as e:  # noqa: BLE001
+        print(f"工作区初始化失败：{e}")
+        traceback.print_exc()
+        return 1
 
-    # 应用皮肤（暂用原 AIChat 皮肤，后续切到 shell/styles.py 浅色主题）
-    apply_skin(app, config.skin)
+    # 内核单例初始化
+    try:
+        vault = config_vault.for_workspace(ws.root)
+        profiles_data = vault.get("api_profiles", [])
+        routing_data = vault.get("step_routing", {})
+        from core.llm_client import LLMProfile
+        profiles = [
+            LLMProfile(
+                name=p["name"],
+                base_url=p["base_url"],
+                model=p["model"],
+                api_key=p.get("api_key", ""),
+                extra=p.get("extra", {}),
+            )
+            for p in profiles_data
+        ]
+        llm_client.init(profiles, routing_data)
+    except Exception:  # noqa: BLE001  -- 首次启动无配置文件，跳过；用户进 UI 后再配
+        pass
 
-    # 主窗口
-    window = MainWindow(config, memory, sessions)
-    window.show()
+    # 提示词仓库
+    prompts_root = os.path.join(os.path.dirname(__file__), "prompts")
+    prompt_repo.init(prompts_root)
 
-    # 注册适配器
-    from domains.chat.adapters import register_adapters
-    register_adapters(window, config)
+    # 加载域清单（chat/novel/studio/warehouse/analysis，按 workspace.enabled_domains 显示）
+    load_domains()
+
+    # 主窗口（一体化壳）
+    win = MainWindow()
+    win.show()
 
     return app.exec()
 

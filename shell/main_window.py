@@ -138,7 +138,7 @@ class MainWindow(QMainWindow):
     def open_domain_tab(self, domain_key: str) -> None:
         # 已开 → 切到
         for i in range(self._tabs.count()):
-            if self._tabs.tabData(i) == domain_key:
+            if self._tabs.tabBar().tabData(i) == domain_key:
                 self._tabs.setCurrentIndex(i)
                 return
         manifest = find_domain(domain_key)
@@ -151,7 +151,7 @@ class MainWindow(QMainWindow):
             logger.error("build widget for %s failed: %s", domain_key, e)
             return
         idx = self._tabs.addTab(widget, manifest.display_name)
-        self._tabs.setTabData(idx, domain_key)
+        self._tabs.tabBar().setTabData(idx, domain_key)
         self._tabs.setCurrentIndex(idx)
 
     def _on_tab_close(self, idx: int) -> None:
