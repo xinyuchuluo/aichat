@@ -1,0 +1,4065 @@
+"""
+WritingPipeline - 写作流水线。
+
+完整流程：
+1. 预检 → 检查项目健康状态
+2. 上下文组装 → 检索三层记忆 + 组装 prompt
+3. 起草 → 调用 LLM 生成正文（流式）
+4. 一致性审查 → 规则+LLM检查，error级别阻断提交
+5. 事实提取 → 从正文提取结构化事实
+6. 摘要生成 → 生成章节摘要（AI自动完成）
+7. Embedding → 正文分块入库
+8. 提交 → 更新档案库 + 生成 commit 记录
+9. 备份 → 自动备份
+
+支持断点续传：中途失败后重试时从 checkpoint 恢复。
+
+新增：
+- auto_init_project() — AI 自动生成世界观、主角设定、总纲、简介
+- auto_chapter_direction() — AI 根据总纲和上下文自动生成章节方向
+"""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Optional
+
+from novelforge.core.novel_categories import category_guide_for
+
+# 校验严重度等级与"校验等级"配置映射
+# severity: high=3, medium=2, low=1
+SEVERITY_RANK = {"high": 3, "medium": 2, "low": 1}
+# 校验等级 → 触发重写/不通过的最低严重度门槛
+# strict(严格): 任何问题都重写; normal(标准): medium 及以上; lenient(宽松): 仅 high; off(仅报告): 不自动重写
+VALIDATION_LEVEL_RANK = {"strict": 1, "normal": 2, "lenient": 3, "off": 99}
+
+
+def issues_at_or_above(issues: list, level: str = "normal") -> list:
+    """返回达到校验等级门槛的问题列表（用于决定是否触发重写）。"""
+    threshold = VALIDATION_LEVEL_RANK.get(level, 2)
+    return [
+        i for i in (issues or [])
+        if SEVERITY_RANK.get(str(i.get("severity", "low")).lower(), 1) >= threshold
+    ]
+
+
+
+from novelforge.core.context.assembler import ContextAssembler
+from novelforge.core.consistency.checker import ConsistencyChecker, ConsistencyReport
+from novelforge.core.llm_client import LLMClient
+from novelforge.core.memory.engine import MemoryEngine, CommitReport
+from novelforge.core.pipeline.prompts import (
+    INIT_WORLDVIEW_PROMPT, INIT_CHARACTER_PROMPT, INIT_OUTLINE_PROMPT,
+    INIT_SYNOPSIS_PROMPT, AUTO_CHAPTER_DIRECTION_PROMPT,
+    AUTO_CHAPTER_TITLE_PROMPT, BATCH_CHAPTER_OUTLINES_PROMPT,
+    OUTLINE_SYSTEM_CONSTRAINTS, OUTLINE_CHAPTER_TASK,
+    CHAPTER_REVISION_PROMPT, INSERT_CHAPTER_ADJUST_PROMPT,
+    SEGMENT_REVISION_PROMPT,
+    PLAUSIBILITY_REVIEW_PROMPT, GENERATE_VOLUMES_PROMPT,
+    HOOK_REVIEW_PROMPT,
+    INIT_ARCHIVE_SEED_PROMPT, genre_prompt_extras,
+)
+from novelforge.utils.logger import logger
+from novelforge.core.pipeline.tag_system import clue_anchors_for_chapter
+
+
+class PipelineStage(Enum):
+    PRECHECK = "预检"
+    CONTEXT_ASSEMBLY = "上下文组装"
+    DRAFTING = "起草正文"
+    REVIEW = "一致性审查"
+    FACT_EXTRACTION = "事实提取"
+    SUMMARY_GENERATION = "生成摘要"
+    EMBEDDING = "向量入库"
+    COMMIT = "提交记忆"
+    BACKUP = "备份"
+    DONE = "完成"
+    # 项目初始化阶段
+    INIT_WORLDVIEW = "生成世界观"
+    INIT_CHARACTER = "生成主角设定"
+    INIT_OUTLINE = "生成总纲"
+    INIT_SYNOPSIS = "生成简介"
+
+
+@dataclass
+class PipelineResult:
+    stage: PipelineStage = PipelineStage.DONE
+    success: bool = True
+    chapter_text: str = ""
+    commit_report: Optional[CommitReport] = None
+    review_report: Optional[ConsistencyReport] = None
+    blocked_by_review: bool = False   # 是否被审查阻断
+    error: str = ""
+    tokens_used: int = 0
+    quality_report: Optional[dict] = None   # 质量审查通道结果（钩子/去重/反AI味）
+
+
+@dataclass
+class InitProjectResult:
+    """项目自动初始化结果。"""
+    success: bool = True
+    worldview: str = ""
+    character: str = ""
+    outline: str = ""
+    synopsis: str = ""
+    error: str = ""
+
+
+class WritingPipeline:
+    """写作流水线。"""
+
+    def __init__(
+        self,
+        memory_engine: MemoryEngine,
+        context_assembler: ContextAssembler,
+        llm_client: LLMClient,
+        project_root: str,
+        consistency_checker: Optional[ConsistencyChecker] = None,
+    ):
+        self._memory = memory_engine
+        self._assembler = context_assembler
+        self._llm = llm_client
+        self._project_root = project_root
+        self._checker = consistency_checker or ConsistencyChecker(memory_engine, llm_client)
+
+    @property
+    def consistency_checker(self) -> ConsistencyChecker:
+        return self._checker
+
+    # ============================================================
+    # AI 自动项目初始化
+    # ============================================================
+
+    # ---- 网文初始化缺项校验（P1-3 兜底，避免全书无情感线/无爽点） ----
+    _WN_ELEMENT_KEYWORDS = {
+        "female_arc": ["女主", "女配", "红颜", "伴侣", "恋", "情感线", "感情线", "她"],
+        "growth": ["升级", "突破", "修炼", "成长", "精进", "变强", "境界", "实力"],
+        "opportunity": ["奇遇", "机缘", "秘境", "宝物", "传承", "机遇", "造化", "法宝"],
+        "crisis": ["危机", "绝境", "追杀", "生死", "阴谋", "敌人", "反派", "对决", "险境", "仇敌"],
+    }
+
+    def _init_missing_webnovel_elements(self, worldview: str, character: str,
+                                        outline: str, synopsis: str) -> list:
+        """本地关键词检测：返回缺失的网文关键元素 key 列表（零 LLM）。"""
+        blob = "\n".join([worldview or "", character or "", outline or "", synopsis or ""])
+        missing = []
+        for key, kws in self._WN_ELEMENT_KEYWORDS.items():
+            if not any(kw in blob for kw in kws):
+                missing.append(key)
+        return missing
+
+    @staticmethod
+    def _build_webnovel_framework_instruction(missing: list) -> str:
+        elem_desc = {
+            "female_arc": "女主长线（须有独立支线与双向互动，不沦为工具人）",
+            "growth": "成长升级体系（明确的境界/实力进阶节点）",
+            "opportunity": "奇遇机缘（秘境/宝物/传承等推动爽点的机遇）",
+            "crisis": "绝境危机（追杀/阴谋/生死对局等压迫性冲突）",
+        }
+        items = "\n".join(f"- {elem_desc[m]}" for m in missing)
+        return (
+            f"\n\n【强制网文框架补缺】你生成的总纲缺失以下关键元素，请在不推翻已有世界观/主角设定的前提下补足：\n"
+            f"{items}\n"
+            f"要求：这些元素必须有机融入全书主线结构，而非生硬堆砌；女主须拥有独立行动目标与成长空间。"
+        )
+
+    def auto_init_project(
+        self,
+        book_name: str,
+        genre: str,
+        inspiration: str,
+        tone: str = "",
+        novel_category: str = "",
+        tags: Optional[list] = None,
+        on_progress: Optional[Callable[[str, str], None]] = None,
+    ) -> InitProjectResult:
+        """
+        AI 自动初始化项目：根据用户提供的核心灵感，
+        自动生成世界观、主角设定、总纲、简介。
+
+        流程：
+        1. 生成世界观设定
+        2. 基于世界观生成主角设定
+        3. 基于主角和世界观生成总纲
+        4. 生成简介
+        5. 将所有内容保存到项目文件
+
+        Args:
+            book_name: 书名
+            genre: 题材
+            inspiration: 用户提供的核心灵感/故事构想
+            tone: 故事基调（暗黑/轻松/史诗/日常等）
+            on_progress: 进度回调 (stage_name, content)
+        """
+        result = InitProjectResult()
+        tone_str = tone or "根据题材自动选择"
+
+        # 内容标签（金手指/扮猪吃老虎/女主等）：作为内容要求注入基础设定生成，
+        # 让世界观/主角/总纲/简介从一开始就自然体现这些套路与题材元素。
+        # 深度化：用 tag_system 渲染（含 doctrine/rules/anchors），而非仅一行名词。
+        from novelforge.core.pipeline.tag_system import render_tag_block
+        _tags = list(tags or [])
+        tags_block = (
+            "\n\n" + render_tag_block(_tags, "本书内容标签体系（生成时须让它们真正发生作用）")
+        ) if _tags else ""
+
+        try:
+            # 1. 生成世界观
+            if on_progress:
+                on_progress("正在生成世界观设定...", "")
+            worldview = self._llm.chat(
+                messages=[{
+                    "role": "user",
+                    "content": INIT_WORLDVIEW_PROMPT.format(
+                        book_name=book_name,
+                        genre=genre,
+                        inspiration=inspiration,
+                        tone=tone_str,
+                    ) + tags_block
+                }],
+                temperature=0.8,
+                max_tokens=4096,
+            )
+            result.worldview = worldview
+            self._save_setting("worldview", worldview)
+            if on_progress:
+                on_progress("世界观设定生成完成", worldview)
+
+            # 2. 生成主角设定
+            if on_progress:
+                on_progress("正在生成主角设定...", "")
+            character = self._llm.chat(
+                messages=[{
+                    "role": "user",
+                    "content": INIT_CHARACTER_PROMPT.format(
+                        book_name=book_name,
+                        genre=genre,
+                        inspiration=inspiration,
+                        tone=tone_str,
+                        worldview=worldview[:2000],
+                        **genre_prompt_extras(genre),
+                    ) + tags_block
+                }],
+                temperature=0.8,
+                max_tokens=4096,
+            )
+            result.character = character
+            self._save_setting("character_main", character)
+            if on_progress:
+                on_progress("主角设定生成完成", character)
+
+            # 3. 生成总纲
+            if on_progress:
+                on_progress("正在生成故事总纲...", "")
+            outline = self._llm.chat(
+                messages=[{
+                    "role": "user",
+                    "content": INIT_OUTLINE_PROMPT.format(
+                        book_name=book_name,
+                        genre=genre,
+                        inspiration=inspiration,
+                        tone=tone_str,
+                        character=character[:2000],
+                        category_guide=category_guide_for(novel_category),
+                        **genre_prompt_extras(genre),
+                    ) + tags_block
+                }],
+                temperature=0.8,
+                max_tokens=4096,
+            )
+            result.outline = outline
+            self._save_outline("master", outline)
+            if on_progress:
+                on_progress("故事总纲生成完成", outline)
+
+            # 3.5 从总纲解析卷结构（最佳努力，失败不影响初始化）
+            try:
+                self.regenerate_volumes_from_master()
+                if on_progress:
+                    on_progress("卷结构已生成", "")
+            except Exception as e:
+                logger.warning(f"从总纲生成卷结构失败（忽略）: {e}")
+
+            # 4. 生成简介
+            if on_progress:
+                on_progress("正在生成小说简介...", "")
+            synopsis = self._llm.chat(
+                messages=[{
+                    "role": "user",
+                    "content": INIT_SYNOPSIS_PROMPT.format(
+                        book_name=book_name,
+                        genre=genre,
+                        inspiration=inspiration,
+                        tone=tone_str,
+                    ) + tags_block
+                }],
+                temperature=0.8,
+                max_tokens=1024,
+            )
+            result.synopsis = synopsis
+            self.save_synopsis(synopsis)
+            if on_progress:
+                on_progress("简介生成完成", synopsis)
+
+            # 5. 将生成的世界观/角色/总纲/简介播种到档案库，
+            #    使第一章规划时就有「已确立的设定/人物/主线」可用。
+            try:
+                self._seed_archive_from_init_texts(
+                    worldview, character, outline, synopsis
+                )
+                if on_progress:
+                    on_progress("档案播种完成", "")
+            except Exception as e_init_seed:
+                logger.warning(f"初始化档案播种失败（不阻塞）: {e_init_seed}")
+
+            # 5.5 把项目深度标签落地为档案（world_settings + 线索锚点 foreshadows），
+            #     让"体系/贯穿线索"成为可检索、逐章提醒的真实结构（深度作用第二条通道）。
+            try:
+                if tags:
+                    synced = self._memory.sync_project_tags()
+                    if on_progress and (synced["world_settings"] or synced["foreshadows"]):
+                        on_progress(
+                            "标签体系已落地档案",
+                            f"体系/线索设定 {synced['world_settings']} 条，贯穿锚点 {synced['foreshadows']} 条",
+                        )
+            except Exception as e_tag_sync:
+                logger.warning(f"标签体系落地档案失败（不阻塞）: {e_tag_sync}")
+
+            # 6. 网文初始化缺项校验兜底：检测总纲/设定是否含女主长线/成长升级/奇遇/绝境，
+            #    缺失则重生成总纲并追加强制网文框架指令（仅 webnovel 题材触发），
+            #    从源头避免全书无情感线、无爽点。
+            try:
+                from novelforge.core.pipeline.prompt_registry import resolve_genre_tag
+                if resolve_genre_tag(genre) == "webnovel":
+                    missing = self._init_missing_webnovel_elements(worldview, character, outline, synopsis)
+                    if missing:
+                        extra = self._build_webnovel_framework_instruction(missing)
+                        regen = self._llm.chat(
+                            messages=[{
+                                "role": "user",
+                                "content": INIT_OUTLINE_PROMPT.format(
+                                    book_name=book_name,
+                                    genre=genre,
+                                    inspiration=inspiration,
+                                    tone=tone_str,
+                                    character=character[:2000],
+                                    category_guide=category_guide_for(novel_category),
+                                    **genre_prompt_extras(genre),
+                                ) + extra
+                            }],
+                            temperature=0.8,
+                            max_tokens=4096,
+                        )
+                        result.outline = regen
+                        self._save_outline("master", regen)
+                        try:
+                            self.regenerate_volumes_from_master()
+                        except Exception:
+                            pass
+                        try:
+                            self._seed_archive_from_init_texts(worldview, character, regen, synopsis)
+                        except Exception as e_seed:
+                            logger.warning(f"补缺后重新播种档案失败（忽略）: {e_seed}")
+                        if on_progress:
+                            on_progress("总纲已按网文框架补缺重生成", regen)
+            except Exception as e_init_check:
+                logger.warning(f"网文初始化缺项校验失败（忽略）: {e_init_check}")
+
+            result.success = True
+            logger.info(f"项目自动初始化完成: {book_name}")
+
+        except Exception as e:
+            result.success = False
+            result.error = str(e)
+            logger.error(f"项目自动初始化失败: {e}")
+
+        return result
+
+    # ============================================================
+    # 单项重新生成（世界观/主角设定/总纲/简介）
+    # ============================================================
+
+    def regenerate_worldview(
+        self,
+        book_name: str,
+        genre: str,
+        inspiration: str,
+        tone: str = "",
+        user_request: str = "",
+    ) -> str:
+        """
+        重新生成世界观设定，覆盖 settings/worldview.md。
+
+        Args:
+            user_request: 用户对世界观重新生成的修改意见（可选）
+        Returns:
+            生成的世界观文本
+        """
+        tone_str = tone or "根据题材自动选择"
+        extra = ""
+        if user_request:
+            extra = f"\n\n用户修改意见：\n{user_request}"
+
+        worldview = self._llm.chat(
+            messages=[{
+                "role": "user",
+                "content": INIT_WORLDVIEW_PROMPT.format(
+                    book_name=book_name,
+                    genre=genre,
+                    inspiration=inspiration,
+                    tone=tone_str,
+                ) + extra
+            }],
+            temperature=0.8,
+            max_tokens=4096,
+        )
+        self._save_setting("worldview", worldview)
+        logger.info("世界观设定已重新生成")
+        return worldview
+
+    def regenerate_character(
+        self,
+        book_name: str,
+        genre: str,
+        inspiration: str,
+        tone: str = "",
+        user_request: str = "",
+    ) -> str:
+        """
+        重新生成主角设定，覆盖 settings/character_main.md。
+        自动读取已有世界观作为上下文。
+        """
+        tone_str = tone or "根据题材自动选择"
+        worldview = self._read_setting("worldview") or "（世界观未生成，请先生成世界观）"
+        extra = ""
+        if user_request:
+            extra = f"\n\n用户修改意见：\n{user_request}"
+
+        character = self._llm.chat(
+            messages=[{
+                "role": "user",
+                "content": INIT_CHARACTER_PROMPT.format(
+                    book_name=book_name,
+                    genre=genre,
+                    inspiration=inspiration,
+                    tone=tone_str,
+                    worldview=worldview[:2000],
+                    **genre_prompt_extras(genre),
+                ) + extra
+            }],
+            temperature=0.8,
+            max_tokens=4096,
+        )
+        self._save_setting("character_main", character)
+        logger.info("主角设定已重新生成")
+        return character
+
+    def regenerate_outline(
+        self,
+        book_name: str,
+        genre: str,
+        inspiration: str,
+        tone: str = "",
+        user_request: str = "",
+        novel_category: str = "",
+    ) -> str:
+        """
+        重新生成故事总纲，覆盖 outline/master.md。
+        自动读取已有主角设定作为上下文。
+        """
+        tone_str = tone or "根据题材自动选择"
+        character = self._read_setting("character_main") or "（主角设定未生成，请先生成主角设定）"
+        extra = ""
+        if user_request:
+            extra = f"\n\n用户修改意见：\n{user_request}"
+
+        outline = self._llm.chat(
+            messages=[{
+                "role": "user",
+                "content": INIT_OUTLINE_PROMPT.format(
+                    book_name=book_name,
+                    genre=genre,
+                    inspiration=inspiration,
+                    tone=tone_str,
+                    character=character[:2000],
+                    category_guide=category_guide_for(novel_category),
+                    **genre_prompt_extras(genre),
+                ) + extra
+            }],
+            temperature=0.8,
+            max_tokens=4096,
+        )
+        self._save_outline("master", outline)
+        logger.info("故事总纲已重新生成")
+        # 同步刷新卷结构，使卷内容与重新生成的总纲保持一致
+        try:
+            self.regenerate_volumes_from_master()
+        except Exception as e:
+            logger.warning(f"重新生成总纲后同步卷结构失败（忽略）: {e}")
+        return outline
+
+    def regenerate_synopsis(
+        self,
+        book_name: str,
+        genre: str,
+        inspiration: str,
+        tone: str = "",
+        user_request: str = "",
+    ) -> str:
+        """
+        重新生成小说简介，更新 project.json 的 description 字段。
+        """
+        tone_str = tone or "根据题材自动选择"
+        extra = ""
+        if user_request:
+            extra = f"\n\n用户修改意见：\n{user_request}"
+
+        synopsis = self._llm.chat(
+            messages=[{
+                "role": "user",
+                "content": INIT_SYNOPSIS_PROMPT.format(
+                    book_name=book_name,
+                    genre=genre,
+                    inspiration=inspiration,
+                    tone=tone_str,
+                ) + extra
+            }],
+            temperature=0.8,
+            max_tokens=1024,
+        )
+        logger.info("小说简介已重新生成")
+        return synopsis
+
+    def get_project_inspiration(self) -> str:
+        """读取项目核心灵感（从 project.json 的 description 字段或自定义字段）"""
+        try:
+            import json as _json
+            meta_path = Path(self._project_root) / "project.json"
+            if meta_path.exists():
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = _json.load(f)
+                return meta.get("inspiration", "") or meta.get("description", "")
+        except Exception:
+            pass
+        return ""
+
+    def save_synopsis(self, synopsis: str):
+        """保存简介到 project.json 的 description 字段"""
+        try:
+            import json as _json
+            meta_path = Path(self._project_root) / "project.json"
+            meta = {}
+            if meta_path.exists():
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = _json.load(f)
+            meta["description"] = synopsis
+            with open(meta_path, "w", encoding="utf-8") as f:
+                _json.dump(meta, f, ensure_ascii=False, indent=2)
+            logger.info("简介已保存到 project.json")
+        except Exception as e:
+            logger.error(f"保存简介失败: {e}")
+
+    def _volume_context_for_range(self, start_chapter: int, end_chapter: int) -> str:
+        """生成本批次章节跨越的卷上下文文本（供大纲/方向规划使用）。"""
+        try:
+            from novelforge.core.pipeline import volumes as vol_mod
+            vols = vol_mod.load_volumes(self._project_root)
+            if not vols:
+                return "（未定义卷结构）"
+            parts = []
+            for v in vols:
+                vs, ve = v.get("start_chapter", 1), v.get("end_chapter", 1)
+                # 仅列出与本批次有交集的卷
+                if ve < start_chapter or vs > end_chapter:
+                    continue
+                seg = f"第{vs}-{ve}章"
+                line = f"- 《{v.get('title','')}》（{seg}）"
+                if v.get("theme"):
+                    line += f" 主题：{v['theme']}"
+                if v.get("summary"):
+                    line += f"；概要：{v['summary']}"
+                parts.append(line)
+            if not parts:
+                return "（本批次不在任何已定义卷范围内）"
+            return "全书卷结构（与本批次相关部分）：\n" + "\n".join(parts)
+        except Exception:
+            return "（卷结构读取失败）"
+
+    def _volume_assignment_for_range(self, start_chapter: int, end_chapter: int) -> str:
+        """生成本批次每一章所属卷的明确映射（驱动大纲内容对齐卷主题）。"""
+        try:
+            from novelforge.core.pipeline import volumes as vol_mod
+            vols = vol_mod.load_volumes(self._project_root)
+            if not vols:
+                return "（尚未定义卷结构，请按起承转合自行合理分卷并标注）"
+            lines = []
+            for cid in range(start_chapter, end_chapter + 1):
+                v = vol_mod.get_volume_for_chapter(vols, cid)
+                if v:
+                    t = f"《{v.get('title', '')}》"
+                    extra = ""
+                    if v.get("theme"):
+                        extra += f" 主题：{v['theme']}"
+                    if v.get("summary"):
+                        extra += f"；概要：{v['summary']}"
+                    lines.append(f"- 第{cid}章 → {t}{extra}")
+                else:
+                    lines.append(f"- 第{cid}章 → （未归属任何卷）")
+            return "\n".join(lines) if lines else "（尚未定义卷结构）"
+        except Exception:
+            return "（卷结构读取失败）"
+
+    def auto_chapter_direction(
+        self,
+        chapter_id: int,
+        book_name: str,
+        genre: str,
+        outline: str,
+        recent_summaries: str,
+        user_direction: str,
+        foreshadows: str,
+        recent_chapter_types: str = "",
+        volume_context: str = "",
+    ) -> dict:
+        """
+        AI 根据总纲和上下文自动生成章节方向建议。
+
+        返回包含 chapter_type, core_events, opening_hook, ending_hook,
+        foreshadowing, direction_detail 的字典。
+
+        当用户只提供简略的故事走向时，调用此方法生成更详细的章节方向，
+        供写作流水线使用。
+        """
+        if not volume_context:
+            volume_context = self._volume_context_for_range(chapter_id, chapter_id)
+        messages = [{
+            "role": "user",
+            "content": AUTO_CHAPTER_DIRECTION_PROMPT.format(
+                chapter_id=chapter_id,
+                book_name=book_name,
+                genre=genre,
+                outline=outline[:3000],
+                recent_summaries=recent_summaries[:2000] if recent_summaries else "（暂无前文摘要，这是第一章）",
+                user_direction=user_direction,
+                foreshadows=foreshadows if foreshadows else "（暂无活跃伏笔）",
+                recent_chapter_types=recent_chapter_types if recent_chapter_types else "（暂无历史数据）",
+                volume_context=volume_context,
+            )
+        }]
+        response = self._llm.chat(messages, temperature=0.7, max_tokens=1024)
+
+        # 尝试解析 JSON
+        try:
+            # 去除可能的 markdown 代码块标记
+            clean = response.strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                clean = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+            import json as _json
+            return _json.loads(clean)
+        except Exception:
+            # 如果解析失败，返回原始文本作为 direction_detail
+            logger.warning(f"章节方向 JSON 解析失败，使用原始文本")
+            return {
+                "chapter_type": "main_plot",
+                "chapter_type_label": "主线推进",
+                "core_events": "",
+                "opening_hook": "",
+                "ending_hook": "",
+                "foreshadowing": "none",
+                "direction_detail": response,
+            }
+
+    @staticmethod
+    def _is_placeholder_title(title: str, chapter_id: int = 0) -> bool:
+        """判断标题是否为占位符（无实质内容）。
+
+        覆盖：空串、'无题'、'新章节'、'新章节2'、'第N章' 等所有无信息量标题，
+        以及 '第N章 xxx' 这类以章节号前缀开头的退化标题。
+        """
+        import re
+        if not title:
+            return True
+        t = title.strip()
+        if t in ("无题", "新章节"):
+            return True
+        # 第N章 / 第N章 xxx 这类以「第N章」开头且无后续实质内容
+        if re.fullmatch(r"第\s*\d+\s*章\s*", t):
+            return True
+        # 新章节 / 新章节N / 新章节Nxxx
+        if re.fullmatch(r"新章节\s*\d*", t):
+            return True
+        # 「第N章 」前缀 + 短无意义后缀（如"第20章 "、"第20章、"）——v4-flash 常见退化
+        if re.match(r"^第\s*\d+\s*章[：:：]?\s*$", t):
+            return True
+        return False
+
+    def auto_chapter_title(self, chapter_text: str) -> str:
+        """AI 自动生成章节标题。"""
+        messages = [{
+            "role": "user",
+            "content": AUTO_CHAPTER_TITLE_PROMPT.format(
+                chapter_text=chapter_text[:500]
+            )
+        }]
+        title = self._llm.chat(messages, temperature=0.5, max_tokens=50)
+        return title.strip().strip('"').strip("'").strip("《》").strip()
+
+    # ============================================================
+    # 批量章节大纲生成 & 章节修订
+    # ============================================================
+
+    def _collect_used_titles(self, start_chapter: int, end_chapter: int, extra: str = "") -> set:
+        """收集本书已用标题（排除本次要重生成的区间），用于约束标题唯一性。
+
+        Args:
+            start_chapter / end_chapter: 本次生成区间，区间内已有标题不计入（将被覆盖）
+            extra: 额外已用标题字符串（逗号/顿号分隔），由调用方传入
+        """
+        used: set = set()
+        # 1) 从已有大纲文件收集（排除本次区间）
+        try:
+            existing = self.get_chapter_outlines() or []
+            for ol in existing:
+                cid = ol.get("chapter_id")
+                if cid is not None and not (start_chapter <= cid <= end_chapter):
+                    t = (ol.get("title") or "").strip()
+                    if t:
+                        used.add(t)
+        except Exception:
+            pass
+        # 2) 调用方额外传入的已用标题（如项目初始化时全书标题）
+        if extra:
+            for t in re.split(r"[，,、;；\n]+", extra):
+                t = t.strip().strip("《》").strip()
+                if t and t not in ("无", "本书尚无其他章节"):
+                    used.add(t)
+        return used
+
+    def generate_chapter_outlines(
+        self,
+        start_chapter: int,
+        end_chapter: int,
+        book_name: str,
+        genre: str,
+        tone: str = "",
+        user_request: str = "",
+        recent_summaries: str = "",
+        foreshadows: str = "",
+        adjacent_outlines: str = "",
+        novel_category: str = "",
+        used_titles: str = "",
+        prior_window: int = 15,
+        on_chapter: Optional[Callable[[int, int, dict], None]] = None,
+    ) -> list[dict]:
+        """
+        AI 逐章【顺序】生成章节大纲。
+
+        与「一次调用批量吐出 N 章」不同，本方法按章节号从小到大逐章生成：
+        第 N 章的大纲始终建立在第 1..N-1 章已真实规划/写出的内容之上
+        （从 chapter_outlines.json 读取前文，并叠加本次运行已生成的章节），
+        从而严格保证上下文连贯、剧情向前推进、标题全局唯一。
+
+        前提：项目已完成 AI 初始化（世界观、设定、总纲、简介已生成）。
+
+        Args:
+            start_chapter / end_chapter: 生成区间
+            user_request: 用户对这批章节的总体要求（可选）
+            on_chapter: 每生成一章后的回调 (chapter_id, end_chapter, outline)，用于进度上报
+            prior_window: 前文章节链只取最近 N 章（滚动窗口），默认 15；全局标题唯一与
+                设定/人物/主线一致性由 used_titles 与 archive_context 保证，不依赖全历史
+            （其余参数保留以兼容旧调用；前文章节链与已用标题均由方法内部基于真实数据计算）
+
+        Returns:
+            章节大纲列表，每个元素包含 chapter_id, chapter_type, title,
+            core_events, opening_hook, ending_hook, foreshadowing, plot_summary 等
+        """
+        # 确保卷结构与总纲一致：若尚无卷定义，则按总纲自动生成卷，
+        # 使后续章节大纲能对齐到总纲管理的卷内容（尊重已有的手动编辑）。
+        try:
+            from novelforge.core.pipeline import volumes as vol_mod
+            if not vol_mod.load_volumes(self._project_root):
+                self.regenerate_volumes_from_master()
+        except Exception as e:
+            logger.warning(f"确保卷结构时出错（忽略）: {e}")
+
+        # 全书章节总数：优先从卷定义的最大 end_chapter 推算（贯穿锚点须按真实全书进度分配阶段），
+        # 否则退化为本次生成区间的 end_chapter。
+        book_total = end_chapter
+        try:
+            from novelforge.core.pipeline import volumes as vol_mod
+            _vols = vol_mod.load_volumes(self._project_root) or []
+            if _vols:
+                _max_end = max(int(v.get("end_chapter", 0) or 0) for v in _vols)
+                if _max_end > 0:
+                    book_total = _max_end
+        except Exception:
+            pass
+
+        # 预读本书线索标签（内容 + 流程），供逐章分配"须推进的贯穿线索锚点"
+        _proj_tags = []
+        _proj_ptags = []
+        try:
+            if self._memory:
+                _proj_tags = self._memory.get_project_tags() or []
+                _proj_ptags = self._memory.get_project_process_tags() or []
+        except Exception:
+            pass
+
+        all_outlines: list[dict] = []
+        for cid in range(start_chapter, end_chapter + 1):
+            # —— 前文章节链：文件里已有的 < cid 的真实大纲 + 本次运行已生成的章节 ——
+            prior_map: dict[int, dict] = {}
+            try:
+                for ol in (self.get_chapter_outlines() or []):
+                    pid = ol.get("chapter_id")
+                    if pid is not None and pid < cid:
+                        prior_map[pid] = ol
+            except Exception:
+                pass
+            for ol in all_outlines:  # 本次运行已生成（尚未落盘）
+                prior_map[ol["chapter_id"]] = ol
+            # 前文章节链只取最近 prior_window 章（滚动窗口），避免 O(N²) token 膨胀；
+            # 全局衔接/一致性由 used_titles（标题唯一）+ archive_context（设定/人物/主线）保证。
+            prior_ids = sorted(prior_map.keys())
+            window_ids = prior_ids[-prior_window:] if prior_window and prior_window > 0 else prior_ids
+            prior_chain = self._format_outlines_as_adjacent(
+                [prior_map[k] for k in window_ids], label_prefix="前文章节"
+            )
+
+            # —— 已用标题：全书已有标题（排除本章） + 本次运行已生成的标题 ——
+            used_set = self._collect_used_titles(cid, cid, extra=used_titles)
+            for ol in all_outlines:
+                t = (ol.get("title") or "").strip()
+                if t:
+                    used_set.add(t)
+            used_str = "、".join(sorted(used_set)) if used_set else ""
+
+            # —— 已确立设定与主线（档案库，截至上一章）：让本章基于真实 canon 规划 ——
+            archive_ctx = self._format_archive_context(cid)
+
+            # —— 网文动态计数器：连续无女主 / 近10章缺失爽点（零 LLM，本地拼接）——
+            female_names = self._collect_female_names()
+            counters = self._compute_outline_counters(
+                [prior_map[k] for k in window_ids], female_names
+            )
+            dynamic_counters = self._format_counters(counters)
+
+            # —— 前一章结尾钩子：用于大纲生成时避免"章末收尾套路复刻" ——
+            _prev_ol = prior_map.get(cid - 1)
+            prev_ending_hook = (((_prev_ol or {}).get("ending_hook") or "").strip()
+                                 if _prev_ol else "")
+
+            # —— 贯穿线索锚点：按本章在全书的进度阶段，取出"须推进"的线索，
+            #     作为结构性约束注入大纲（让线索真正贯穿全文，而非只靠模型自觉）——
+            clue_block = ""
+            try:
+                clue_block = clue_anchors_for_chapter(
+                    _proj_tags, _proj_ptags, book_total, cid
+                )
+            except Exception as e:
+                logger.warning(f"第{cid}章线索锚点计算失败（忽略）: {e}")
+
+            ol = self._generate_single_outline(
+                chapter_id=cid,
+                prior_chain=prior_chain,
+                prev_ending_hook=prev_ending_hook,
+                used_titles=used_str,
+                clue_anchors=clue_block,
+                archive_context=archive_ctx,
+                dynamic_counters=dynamic_counters,
+                book_name=book_name,
+                genre=genre,
+                tone=tone,
+                user_request=user_request,
+                recent_summaries=recent_summaries,
+                foreshadows=foreshadows,
+                novel_category=novel_category,
+            )
+            all_outlines.append(ol)
+
+            # —— 档案前置：把本章大纲规划出的设定/主线写进档案库，
+            #     使后续章节（含下一章）能基于「已确立内容」而非空白生成 ——
+            try:
+                self._seed_archive_from_outline(cid, ol)
+            except Exception as e:
+                logger.warning(f"第{cid}章大纲写档案失败（忽略）: {e}")
+
+            # 增量落盘：每生成一章立即保存，中途关闭/崩溃也不丢进度
+            try:
+                self.save_chapter_outlines(all_outlines)
+            except Exception as e:
+                logger.warning(f"第{cid}章大纲增量保存失败（忽略）: {e}")
+
+            if on_chapter:
+                try:
+                    on_chapter(cid, end_chapter, ol)
+                except Exception:
+                    pass
+
+        logger.info(f"顺序生成完成: 共 {len(all_outlines)} 个章节大纲 (第{start_chapter}-{end_chapter}章)")
+        return all_outlines
+
+    # 章节类型 → 节奏定位 的兜底映射（大纲未返回 rhythm 字段时用于推断，
+    # 使旧大纲/解析失败的大纲也能在写作时获得「本章节奏定位」硬约束）
+    _RHYTHM_BY_TYPE = {
+        "growth_upgrade": "爽点",
+        "face_slap_hide": "爽点",
+        "face_slap": "爽点",
+        "opportunity_luck": "爽点",
+        "opportunity": "爽点",
+        "competitive_game": "爽点",
+        "competition": "爽点",
+        "crisis_survival": "危机感",
+        "main_plot": "危机感",
+        "emotion_buffer": "情感互动",
+        "inner_monologue": "情感互动",
+        "worldview_focus": "世界观揭秘",
+        "atmosphere": "世界观揭秘",
+        "transition": "缓冲过渡",
+        "tame_beast": "爽点",
+        "devour_refine": "爽点",
+        "golden_finger": "爽点",
+    }
+
+    @classmethod
+    def _infer_rhythm_from_type(cls, chapter_type: str) -> str:
+        """由章节类型推断节奏定位；未知类型返回空串（不注入硬约束）。"""
+        if not chapter_type:
+            return ""
+        return cls._RHYTHM_BY_TYPE.get(str(chapter_type).strip(), "")
+
+    def _generate_single_outline(
+        self,
+        chapter_id: int,
+        prior_chain: str,
+        used_titles: str,
+        archive_context: str = "",
+        book_name: str = "",
+        genre: str = "",
+        tone: str = "",
+        user_request: str = "",
+        recent_summaries: str = "",
+        foreshadows: str = "",
+        novel_category: str = "",
+        prev_ending_hook: str = "",
+        dynamic_counters: str = "",
+        clue_anchors: str = "",
+    ) -> dict:
+        """顺序生成单章大纲（内部方法）。第 chapter_id 章基于 prior_chain（真实前文章节链）。"""
+        outline = self._read_outline()
+        if not outline:
+            raise RuntimeError("未找到故事总纲，请先进行AI项目初始化")
+
+        worldview = self._read_setting("worldview")
+        character = self._read_setting("character_main")
+
+        # 若参数未传入，才从 memory 读取近期摘要与活跃伏笔（兼容旧调用）
+        if not recent_summaries and self._memory:
+            try:
+                all_summaries = self._memory._summary.get_all_summaries()
+                if all_summaries:
+                    recent = [s for s in all_summaries if s.chapter_id < chapter_id]
+                    recent_summaries = "\n".join([
+                        f"第{s.chapter_id}章《{s.title}》: {s.one_line_summary}\n{s.plot_progress}"
+                        for s in recent[-5:]
+                    ]) if recent else "（暂无前文摘要）"
+            except Exception:
+                recent_summaries = "（暂无前文摘要）"
+
+        if not foreshadows and self._memory:
+            try:
+                active_fs = self._memory._archive.get_active_foreshadows()
+                if active_fs:
+                    foreshadows = "\n".join([
+                        f"- [{fs.status}] {fs.description} (第{fs.planted_chapter}章埋下)"
+                        for fs in active_fs
+                    ])
+            except Exception:
+                foreshadows = "（暂无活跃伏笔）"
+
+        if not recent_summaries:
+            recent_summaries = "（暂无前文摘要）"
+        if not foreshadows:
+            foreshadows = "（暂无活跃伏笔）"
+
+        vol_mod_ref = None
+        vols_for_assign = []
+        try:
+            from novelforge.core.pipeline import volumes as vol_mod_ref
+            vols_for_assign = vol_mod_ref.load_volumes(self._project_root)
+        except Exception:
+            vols_for_assign = []
+
+        if not prior_chain:
+            prior_chain = "（这是开篇阶段，尚无前文章节，请基于总纲为全书开一个稳妥的头）"
+
+        # 读取简介（总纲的补充，注入到大纲 prompt 确保整体方向一致）
+        synopsis_str = ""
+        try:
+            meta_path = Path(self._project_root) / "project.json"
+            if meta_path.exists():
+                import json as _json
+                meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+                synopsis_str = (meta.get("description") or "")[:1000]
+        except Exception:
+            synopsis_str = ""
+
+        # 计算章节位置（在卷内/全书中的位置，供节奏规划参考）
+        chapter_position = self._calc_chapter_position(chapter_id)
+
+        # 时期上下文：当前章所属时期 + 当前卷规划段（让大纲也严格忠于本卷设定）
+        phase_label = ""
+        volume_plan = ""
+        try:
+            phase_ctx = self._memory.get_phase_context(chapter_id)
+            phase_label = phase_ctx.get("phase_label", "")
+            volume_plan = phase_ctx.get("current_volume_plan", "")
+        except Exception:
+            phase_label = ""
+            volume_plan = ""
+        if not volume_plan:
+            volume_plan = "（总纲未提供分卷规划，请严格遵循上方全书总纲与本卷上下文）"
+
+        messages = [
+            {
+                "role": "system",
+                "content": OUTLINE_SYSTEM_CONSTRAINTS.format(
+                    book_name=book_name,
+                    genre=genre,
+                    tone=tone or "根据题材自动选择",
+                    outline=outline[:5000],
+                    synopsis=synopsis_str or "（暂无简介）",
+                    worldview=(worldview or "（未生成）")[:3000],
+                    character=(character or "（未生成）")[:3000],
+                    volume_context=self._volume_context_for_range(chapter_id, chapter_id),
+                    volume_assignment=self._volume_assignment_for_range(chapter_id, chapter_id),
+                    chapter_position=chapter_position,
+                    phase_label=phase_label,
+                    volume_plan=volume_plan,
+                    dynamic_counters=dynamic_counters or "（暂无动态计数器数据）",
+                    **genre_prompt_extras(genre),
+                ),
+            },
+            {
+                "role": "user",
+                "content": OUTLINE_CHAPTER_TASK.format(
+                    chapter_id=chapter_id,
+                    prior_chain=prior_chain,
+                    prev_ending_hook=prev_ending_hook or "（无，本章附近无前一章结尾钩子可参考）",
+                    archive_context=archive_context or "（档案库暂无已确立内容）",
+                    recent_summaries=recent_summaries,
+                    foreshadows=foreshadows,
+                    clue_anchors=clue_anchors or "（本书无贯穿线索标签，或本章所处阶段暂无对应锚点）",
+                    user_request=user_request or "（用户无特殊要求，请根据总纲自由规划）",
+                    used_titles=used_titles or "（无，本书尚无其他章节）",
+                    category_guide=category_guide_for(novel_category),
+                    **genre_prompt_extras(genre),
+                ),
+            },
+        ]
+
+        # 结尾钩子防复刻：与前一章结尾钩子对比，雷同或为空则纠正重试
+        # 同时校验标题质量（占位/重复/退化），不合格也重试
+        max_retry = 3
+        data = None
+        for attempt in range(max_retry + 1):
+            response = self._llm.chat(messages, temperature=0.7, max_tokens=2000)
+            try:
+                data = self._parse_single_outline(
+                    response, chapter_id, vol_mod_ref, vols_for_assign, used_titles
+                )
+            except Exception as e:
+                logger.error(f"单章大纲 JSON 解析失败 (第{chapter_id}章, attempt {attempt}): {e}")
+                logger.error(f"LLM 原始响应 (前500字): {response[:500]}")
+                data = None
+            if data is None:
+                # 解析彻底失败：用正则从原始响应中部分提取关键字段（比旧方案全空+截断残骸好得多）
+                logger.warning(f"单章大纲 JSON 所有解析策略均失败 (第{chapter_id}章, attempt {attempt})，尝试正则部分提取")
+                data = self._extract_outline_fields_fallback(response, chapter_id)
+            # 校验：结尾钩子（空/雷同）、标题（占位/重复）、内容实质（core_events/plot_summary 空）
+            eh = (data.get("ending_hook") or "").strip()
+            title_invalid = self._outline_title_invalid(data.get("title", ""), chapter_id, used_titles)
+            hook_invalid = self._ending_hook_invalid(eh, prev_ending_hook)
+            content_invalid = self._outline_content_invalid(data)
+
+            # 严重情形：核心内容缺失 → 必须整章重跑（带纠正提示，最多 max_retry 次）
+            if content_invalid:
+                if attempt < max_retry:
+                    correction = (
+                        "【纠正】大纲内容不完整：核心事件(core_events)和情节摘要(plot_summary)"
+                        "不能为空或仅占位。必须填写本章要发生的具体事件"
+                        "(core_events 各条不少于30字)和情节走向(plot_summary 不少于50字)，"
+                        "且必须承接上一章、为下一章埋下钩子。"
+                    )
+                    messages = messages + [{"role": "user", "content": correction}]
+                    continue
+                return data  # 重试耗尽仍空：兜底返回，避免死循环
+
+            # 轻量情形：仅标题/钩子不合格，但内容已达标 → 定向廉价补生成，不重跑整章大纲。
+            # 避免为修一个标题/钩子把已合格的 core_events/plot_summary 全部重生成（省 token）。
+            if title_invalid:
+                new_title = self._fix_title_only(chapter_id, used_titles)
+                if new_title:
+                    data["title"] = new_title
+            if hook_invalid:
+                new_hook = self._force_generate_ending_hook(chapter_id, data, prev_ending_hook)
+                if new_hook:
+                    data["ending_hook"] = new_hook
+            return data  # 定向补生成后直接返回（无论是否彻底合格，钩子均有兜底值）
+        return data
+
+    # ------------------------------------------------------------------
+    # JSON 健壮解析辅助（治 LLM 输出控制字符 / 截断 / 格式偏差）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clean_control_chars(text: str) -> str:
+        """去除 JSON 字符串值内的非法控制字符（0x00-0x1f），保留 \\n \\t \\r。"""
+        result = []
+        for ch in text:
+            code = ord(ch)
+            if code < 0x20 and ch not in ("\t", "\n", "\r"):
+                continue
+            result.append(ch)
+        return "".join(result)
+
+    @staticmethod
+    def _fix_trailing_commas(text: str) -> str:
+        """去除 JSON 中常见的 LLM 尾逗号瑕疵：[...] 中的项后多余逗号、{...} 中的键值对后多余逗号。
+        用正则替换 ',]' → ']', ',}' → '}', ',\\s*]' → ']', ',\\s*}' → '}'。"""
+        import re as _re
+        # 去掉 ] 或 } 前的逗号（可能带空白）
+        fixed = _re.sub(r',\s*(\])', r'\1', text)
+        fixed = _re.sub(r',\s*(\})', r'\1', fixed)
+        return fixed
+
+    def _extract_outline_fields_fallback(self, raw: str, chapter_id: int) -> dict:
+        """JSON 完全无法解析时的最后兜底：用正则从原始响应中提取关键字段。
+
+        不保证完整性，但至少能捞回 title / core_events / ending_hook / opening_hook，
+        比旧方案（全空 + response[:500] 截断残骸）好得多。
+        """
+        import re as _re
+        raw = (raw or "").strip()
+
+        def _extract(field: str, pattern: str, default="") -> str:
+            m = _re.search(pattern, raw)
+            if m:
+                val = m.group(1).strip()
+                # 清理可能的 JSON 转义
+                val = val.replace('\\"', '"').replace("\\\\", "\\")
+                return val if val else default
+            return default
+
+        title = _extract("title", r'"title"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', "")
+        if not title or self._is_placeholder_title(title, chapter_id):
+            title = f"第{chapter_id}章"
+
+        # core_events 可能是数组 [...]
+        ce_match = _re.search(r'"core_events"\s*:\s*\[(.*?)\]', raw, _re.DOTALL)
+        if ce_match:
+            ce_raw = ce_match.group(1)
+            events = [e.strip().strip('"').replace('\\"', '"') for e in ce_raw.split(",") if e.strip().strip('"')]
+            core_events = events
+        else:
+            # 也可能是字符串形式
+            ce_str = _extract("core_events", r'"core_events"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', "")
+            core_events = [ce_str] if ce_str else ""
+
+        opening_hook = _extract("opening_hook", r'"opening_hook"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', "")
+        ending_hook = _extract("ending_hook", r'"ending_hook"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', "")
+        foreshadowing = _extract("foreshadowing", r'"foreshadowing"\s*:\s*"([^"]*(?:\\.[^"]*)*)"', "") or "none"
+        ct = _extract("chapter_type", r'"chapter_type"\s*:\s*"([^"]+)"', "main_plot")
+        ctl = _extract("chapter_type_label", r'"chapter_type_label"\s*:\s*"([^"]+)"', "")
+
+        return {
+            "chapter_id": chapter_id,
+            "chapter_type": ct,
+            "chapter_type_label": ctl or "主线推进",
+            "title": title,
+            "core_events": core_events,
+            "opening_hook": opening_hook,
+            "ending_hook": ending_hook,
+            "foreshadowing": foreshadowing,
+            "plot_summary": raw[:800] if len(raw) > 800 else raw,  # 存原始文本但不再截断到破坏结构
+            "volume": "",
+            "rhythm": self._infer_rhythm_from_type(ct) or "",
+            "confirmed": False,
+        }
+
+    # ------------------------------------------------------------------
+    # 单章大纲解析 / 结尾钩子校验助手
+    # ------------------------------------------------------------------
+    def _parse_single_outline(self, response: str, chapter_id: int,
+                              vol_mod_ref, vols_for_assign, used_titles: str) -> dict:
+        """解析单章大纲 JSON（多策略健壮解析），做字段兜底与标题占位重试。失败抛异常。
+
+        解析策略（按优先级）：
+          1. 去控制字符 + strict=False json.loads（处理 LLM 输出的未转义换行等）
+          2. 去 ``` 代码块包裹后重试
+          3. 复用 _parse_json_block（截取 { } 区间 + 截断修复补括号）
+          4. 正则部分提取：从原始文本中捞 title / core_events / ending_hook 等关键字段
+        """
+        import re as _re
+
+        clean = (response or "").strip()
+        last_err = None
+        data = None
+
+        # ---- 策略 1: 去控制字符 + strict=False（解决 "Invalid control character"）----
+        try:
+            # 去除字符串值内的非法控制字符（保留 \\n \\t \\r，去掉其余 0x00-0x1f）
+            _cleaned = self._clean_control_chars(clean)
+            # 去除常见的 LLM 输出格式瑕疵：尾逗号 (trailing comma)
+            _cleaned = self._fix_trailing_commas(_cleaned)
+            data = json.loads(_cleaned, strict=False)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            if isinstance(data, dict) and "chapter_type" in data:
+                pass  # 成功
+            else:
+                data = None
+        except Exception as e:
+            last_err = f"strategy1(strict=False): {e}"
+            data = None
+
+        # ---- 策略 2: 去 ``` 代码块包裹后重试 ----
+        if data is None:
+            try:
+                inner = clean
+                if "```" in inner:
+                    for part in inner.split("```"):
+                        part = part.strip()
+                        if part.lower() in ("json", "javascript", ""):
+                            continue
+                        if part.startswith("{"):
+                            inner = part
+                            break
+                _cleaned = self._clean_control_chars(inner)
+                data = json.loads(_cleaned, strict=False)
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                if not (isinstance(data, dict) and "chapter_type" in data):
+                    data = None
+            except Exception as e:
+                last_err = f"strategy2(codeblock): {e}"
+                data = None
+
+        # ---- 策略 3: 复用 _parse_json_block（截取 {} 区间 + 截断修复）----
+        if data is None:
+            try:
+                parsed = self._parse_json_block(clean)
+                if isinstance(parsed, dict) and "chapter_type" in parsed:
+                    data = parsed
+                elif isinstance(parsed, dict) and "error" in parsed:
+                    last_err = f"strategy3(json_block): parse_error"
+                    data = None
+                else:
+                    data = None
+            except Exception as e:
+                last_err = f"strategy3(json_block): {e}"
+                data = None
+
+        # ---- 全部策略失败 → 抛异常（调用方会走兜底/部分提取路径）----
+        if data is None:
+            raise ValueError(f"所有 JSON 解析策略均失败: {last_err}")
+
+        # 以下为原有逻辑（字段兜底 / 标题占位重试 / 卷归属 / rhythm 推断）
+
+        data["chapter_id"] = chapter_id
+        data["confirmed"] = False
+
+        # 卷归属
+        if vol_mod_ref is not None and vols_for_assign:
+            try:
+                v = vol_mod_ref.get_volume_for_chapter(vols_for_assign, chapter_id)
+                data["volume"] = v.get("title", "") if v else ""
+            except Exception:
+                data["volume"] = ""
+        else:
+            data["volume"] = ""
+
+        title = (data.get("title") or "").strip()
+        if not title:
+            title = f"第{chapter_id}章"
+        # 注：占位/重复标题的廉价补生成已上移到 _generate_single_outline 的循环里统一处理
+        # （与结尾钩子补生成走同一套定向修复逻辑），此处保持纯解析、不触发 LLM。
+        data["title"] = title
+
+        # 字段兜底，避免缺字段导致下游 KeyError
+        if not data.get("chapter_type"):
+            data["chapter_type"] = "main_plot"
+        if not data.get("chapter_type_label"):
+            data["chapter_type_label"] = "主线推进"
+        if not data.get("core_events"):
+            data["core_events"] = ""
+        if not data.get("opening_hook"):
+            data["opening_hook"] = ""
+        if not data.get("ending_hook"):
+            data["ending_hook"] = ""
+        if not data.get("foreshadowing"):
+            data["foreshadowing"] = "none"
+        if not data.get("plot_summary"):
+            data["plot_summary"] = ""
+
+        # 节奏标签（本章节奏定位）：缺省时按章节类型推断，保证写作提示词有硬约束
+        if not data.get("rhythm"):
+            data["rhythm"] = self._infer_rhythm_from_type(data.get("chapter_type")) or ""
+        else:
+            data["rhythm"] = str(data["rhythm"]).strip()
+
+        return data
+
+    def _ending_hooks_too_similar(self, a: str, b: str) -> bool:
+        """判断两个结尾钩子是否高度雷同（同一收尾套路）。
+
+        双重拦截：① 套路意象词库（motif）命中 >=2 个即判雷同；
+        ② 字符级 bigram Jaccard 相似度兜底捕获「换词不换结构」的复刻。
+        """
+        a, b = (a or "").strip(), (b or "").strip()
+        if not a or not b:
+            return False
+        motif = [
+            "山崖", "拐杖", "嘴角", "第三块碎片", "消失在", "雾中", "夜雾",
+            "诡异的笑容", "意味深长", "碎片醒了", "那扇门", "背影", "渐行渐远",
+            "灯火", "阴影里", "悄然离去", "风声", "蓦然回首", "残月", "孤峰",
+            "无声无息", "化作流光", "沉入", "深渊", "回廊尽头", "人影", "远去",
+            "瞳孔", "冷笑", "指节", "衣袂", "云层之上", "地平线", "暮色",
+            "余音", "消散在", "隐入", "抬眼", "转身离去", "夜色中",
+        ]
+        sa = {m for m in motif if m in a}
+        sb = {m for m in motif if m in b}
+        if sa and sb and len(sa & sb) >= 2:
+            return True
+        # 字符级 bigram Jaccard 相似度（兜底捕获换词不换结构的复刻）
+        def _bg(s):
+            s = "".join(s.split())
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+        ba, bb = _bg(a), _bg(b)
+        if not ba or not bb:
+            return False
+        return len(ba & bb) / len(ba | bb) > 0.62
+
+    def _ending_hook_invalid(self, eh: str, prev_eh: str) -> bool:
+        """结尾钩子是否不合格：为空，或与前一章结尾钩子雷同。"""
+        eh = (eh or "").strip()
+        if not eh:
+            return True
+        if not prev_eh or not prev_eh.strip():
+            return False
+        return self._ending_hooks_too_similar(eh, prev_eh)
+
+    def _outline_title_invalid(self, title: str, chapter_id: int, used_titles: str) -> bool:
+        """大纲标题是否不合格：占位、与已有标题重复/过度相似。"""
+        t = (title or "").strip()
+        if not t or self._is_placeholder_title(t, chapter_id):
+            return True
+        # 与已用标题列表比对（used_titles 是逗号或换行分隔的字符串）
+        if used_titles and used_titles.strip():
+            used_list = [u.strip() for u in used_titles.replace("，", ",").replace("\n", ",").split(",") if u.strip()]
+            for ut in used_list:
+                if not ut:
+                    continue
+                if t == ut:
+                    return True  # 完全重复
+                # 相似度检测：bigram Jaccard > 0.7 视为过度相似
+                if self._title_similarity(t, ut) > 0.7:
+                    return True
+        return False
+
+    @staticmethod
+    def _title_similarity(a: str, b: str) -> float:
+        """两个标题的字符级 bigram Jaccard 相似度（0~1）。"""
+        a, b = a.replace(" ", ""), b.replace(" ", "")
+        if not a or not b:
+            return 0.0
+        def _bg(s):
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+        ba, bb = _bg(a), _bg(b)
+        if not ba or not bb:
+            return 0.0
+        return len(ba & bb) / len(ba | bb)
+
+    def _fix_title_only(self, chapter_id: int, used_titles: str) -> str:
+        """内容已达标、仅标题不合格时的廉价补生成（不重跑整章大纲）。
+
+        只返回新标题字符串；调用方负责写回 data["title"]。LLM 调用失败时返回空串，
+        由上层兜底（保留原标题或默认标题）。max_tokens=50，远低于整章大纲调用。
+        """
+        try:
+            resp = self._llm.chat(
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"为长篇小说第{chapter_id}章生成一个4~12字、有悬念/吸引力、有实质内容的章节标题。"
+                        f"注意：①避免与以下已有标题重复：{used_titles}；"
+                        f"②不要用'第N章'、'新章节'、'无题'等占位。"
+                        f"只输出标题本身，不要其他内容。"
+                    )
+                }],
+                temperature=0.7,
+                max_tokens=50,
+            )
+            new_title = (resp or "").strip().strip('"\'').strip()
+            if new_title and len(new_title) >= 2 and not self._is_placeholder_title(new_title, chapter_id):
+                return new_title[:15]
+        except Exception:
+            pass
+        return ""
+
+    def _force_generate_ending_hook(self, chapter_id: int, outline_data: dict, prev_ending_hook: str) -> str:
+        """所有重试耗尽后 ending_hook 仍为空时的最终兜底：用 LLM 单独生成一个。
+
+        比静默接受空钩子好得多——至少保证每章都有可用的收尾悬念。
+        """
+        try:
+            title = outline_data.get("title", f"第{chapter_id}章")
+            core_events = outline_data.get("core_events", "")
+            prompt = (
+                f"为小说第{chapter_id}章《{title}》设计一个结尾钩子（10~30字）。\n"
+                f"本章核心事件：{core_events}\n"
+            )
+            if prev_ending_hook and prev_ending_hook.strip():
+                prompt += f"前一章结尾钩子（务必避开，换一套完全不同的收尾意象）：{prev_ending_hook}\n"
+            prompt += "要求：悬念/疑问/反转/微妙变化，不要复刻套路（山崖/雾中/背影/远去）。只输出钩子内容，不要其他文字。"
+            resp = self._llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.8,
+                max_tokens=80,
+            )
+            result = resp.strip().strip('"\'').strip()
+            if len(result) >= 6:
+                logger.info(f"第{chapter_id}章 ending_hook 兜底生成成功: {result}")
+                return result
+        except Exception as e:
+            logger.warning(f"第{chapter_id}章 ending_hook 兜底生成失败: {e}")
+        # 终极兜底：基于核心事件拼一个
+        ce = (outline_data.get("core_events") or "").strip()
+        if ce:
+            return f"随着{ce[:15]}的落幕，更大的阴影正在悄然逼近……"
+        return f"第{chapter_id}章末尾，命运的齿轮悄然转动。"
+
+    @staticmethod
+    def _outline_content_invalid(outline: dict) -> bool:
+        """大纲实质性内容是否不完整：核心事件(core_events)与情节摘要(plot_summary)同时为空/占位。
+
+        这是最致命的退化模式——v4-flash 可能返回「标题正常但内容全空」的大纲。
+        正文生成若基于这种空大纲，会编造脱离设定的剧情，并污染后续所有章节档案（无限返工根源）。
+        本方法同时被「大纲生成重试」与「正文生成闸门」复用。
+        """
+        if not outline or not isinstance(outline, dict):
+            return True
+        ce = outline.get("core_events") or ""
+        ps = outline.get("plot_summary") or ""
+        if isinstance(ce, list):
+            ce = " ".join(str(x) for x in ce if x)
+        ce = (ce or "").strip()
+        ps = (ps or "").strip()
+        # 两者都为空 → 无效（ch20 全空退化场景）
+        if not ce and not ps:
+            return True
+        # 合计实质内容过短（<10字）→ 视为占位/桩件，无效
+        if len(ce) + len(ps) < 10:
+            return True
+        return False
+
+    # 网文核心爽点类型（用于「近10章缺失爽点」配额判定）
+    CORE_BEAT_TYPES = {"growth_upgrade", "face_slap_hide", "opportunity_luck", "crisis_survival"}
+
+    def _collect_female_names(self) -> set:
+        """从档案库收集女性角色名（role 含「女」），用于大纲计数检测女主是否出场。"""
+        names: set = set()
+        if not self._memory:
+            return names
+        try:
+            for c in self._memory._archive.get_all_characters():
+                if "女" in (c.role or ""):
+                    if c.name:
+                        names.add(c.name)
+                    for a in (c.aliases or []):
+                        if a:
+                            names.add(a)
+        except Exception:
+            pass
+        return names
+
+    def _compute_outline_counters(self, prior_outlines: list, female_names: set) -> dict:
+        """基于真实前文章节计算网文全局计数器（零 LLM，本地拼接）。
+
+        - continuous_no_female: 从 cid-1 向前数，连续无女主出场的章节数（封顶 12）
+        - lack_core_beat: 近 10 章是否缺失任一类核心爽点（升级/奇遇/打脸/绝境）
+        - missing_beats: 缺失的爽点类型集合
+        """
+        prior = [o for o in (prior_outlines or []) if isinstance(o, dict) and o.get("chapter_id") is not None]
+        # 连续无女主（从最近一章向前回溯）
+        no_female = 0
+        for o in sorted(prior, key=lambda o: o["chapter_id"], reverse=True):
+            blob = " ".join([
+                str(o.get("title", "")), str(o.get("core_events", "")),
+                str(o.get("plot_summary", "")),
+            ])
+            if female_names and any(fn and fn in blob for fn in female_names):
+                break
+            no_female += 1
+            if no_female >= 12:
+                break
+        # 近 10 章核心爽点覆盖
+        recent = sorted(prior, key=lambda o: o["chapter_id"])[-10:]
+        covered = {str(o.get("chapter_type", "")) for o in recent}
+        missing_beats = sorted(self.CORE_BEAT_TYPES - covered)
+        return {
+            "continuous_no_female": no_female,
+            "lack_core_beat": len(missing_beats) > 0,
+            "missing_beats": missing_beats,
+        }
+
+    @staticmethod
+    def _format_counters(counters: dict) -> str:
+        n = int(counters.get("continuous_no_female", 0))
+        if n >= 8:
+            female_line = (f"连续无女主出场：{n} 章（已达阈值 8，本章【必须】安排女主互动或独立剧情，"
+                           f"禁止纯工具人跟随）")
+        else:
+            female_line = f"连续无女主出场：{n} 章（阈值 8，尚未触顶）"
+        if counters.get("lack_core_beat"):
+            miss = "、".join(counters.get("missing_beats", [])) or "升级/奇遇/打脸/绝境"
+            beat_line = (f"近 10 章缺失核心爽点（{miss}），本章【必须】自动分配对应爽点章节类型填补，"
+                         f"不得生成纯过渡白开水剧情")
+        else:
+            beat_line = "近 10 章核心爽点（升级/奇遇/打脸/绝境）已覆盖"
+        return ("【动态进度计数器（基于真实前文章节，必须实时响应）】\n"
+                f"- {female_line}\n"
+                f"- {beat_line}")
+
+    def _format_archive_context(self, chapter_id: int) -> str:
+        """从档案库读取「已确立设定与主线」（截至 chapter_id 之前），供生成大纲时作为上下文锚点。
+
+        这样后续大纲能基于真实 canon（世界观设定/人物/主线事件/未回收伏笔）规划，
+        而不是凭空编造——与「大纲阶段即生成档案」配套使用。
+        """
+        if not self._memory or not getattr(self._memory, "_archive", None):
+            return "（档案库不可用）"
+        try:
+            arch = self._memory._archive
+            parts: list[str] = []
+
+            # 已确立世界观设定
+            try:
+                wss = arch.get_world_settings() or []
+                if wss:
+                    parts.append("【已确立世界观设定】")
+                    for ws in wss[:40]:
+                        parts.append(f"- {ws.category}/{ws.name}: {ws.description}")
+            except Exception:
+                pass
+
+            # 已登场人物
+            try:
+                chars = arch.get_all_characters() or []
+                if chars:
+                    parts.append("【已登场人物】")
+                    for c in chars[:40]:
+                        st = f"（当前: {c.current_state}）" if c.current_state else ""
+                        parts.append(f"- {c.name}（{c.role}）{st}")
+            except Exception:
+                pass
+
+            # 已发生主线事件（chapter_id 之前）
+            try:
+                tls = arch.get_timeline() or []
+                tls = [t for t in tls if t.chapter_id < chapter_id]
+                if tls:
+                    parts.append("【已发生主线事件】")
+                    for t in tls[-40:]:
+                        inv = "、" + "、".join(t.characters_involved) if t.characters_involved else ""
+                        parts.append(f"- 第{t.chapter_id}章 {t.event}：{t.description}{inv}")
+            except Exception:
+                pass
+
+            # 活跃伏笔（未回收）
+            try:
+                fss = arch.get_active_foreshadows() or []
+                if fss:
+                    parts.append("【活跃伏笔（未回收）】")
+                    for fs in fss[:30]:
+                        parts.append(f"- 第{fs.planted_chapter}章埋下: {fs.description} [{fs.status}]")
+            except Exception:
+                pass
+
+            # 计划事件账本（前向规划：本章窗口内应推进 + 逾期未完成）—— 治「分开生成做不好」
+            try:
+                due = arch.format_due_events(chapter_id)
+                if due:
+                    parts.append(due)
+            except Exception:
+                pass
+
+            return "\n".join(parts) if parts else "（档案库暂无已确立内容）"
+        except Exception as e:
+            logger.warning(f"读取档案上下文失败: {e}")
+            return "（档案库读取失败）"
+
+    def _seed_archive_from_outline(self, chapter_id: int, outline: dict):
+        """把大纲规划出的设定/主线事实写入档案库（仅当该章尚未写正文，避免覆盖正文事实）。
+
+        让档案在「规划阶段」就反映已确立的设定与主线，供后续大纲消费。
+        若该章已有正文（摘要存在），正文事实为权威，不再用大纲覆盖。
+        """
+        # 若该章已有正文，正文事实为权威，跳过（防止大纲种子覆盖正文事实）
+        if self._memory and getattr(self._memory, "_summary", None):
+            try:
+                if self._memory._summary.get_summary(chapter_id):
+                    logger.info(f"第{chapter_id}章已有正文摘要，跳过大纲档案种子")
+                    return
+            except Exception:
+                pass
+
+        if not self._memory or not getattr(self._memory, "_archive", None):
+            return
+
+        # 省 token：直接用大纲结构化字段【本地】构建 facts（不调用 LLM extract_facts）。
+        # 大纲已含 概要/伏笔，足以支撑后续大纲的上下文锚点（时间线/活跃伏笔）；
+        # 人物/世界观设定等更丰富的事实，留待正文真正写出时由 commit_chapter 的
+        # extract_facts 幂等覆盖为权威事实。
+        facts = {"characters": [], "foreshadows": [], "timeline_events": [], "world_settings": []}
+
+        # 主线事件：把本章概要作为一条时间线，供后续大纲看到「已发生什么」
+        plot = (outline.get("plot_summary") or outline.get("core_events") or "").strip()
+        title = outline.get("title", "")
+        if plot:
+            facts["timeline_events"].append({
+                "event": f"第{chapter_id}章《{title}》",
+                "timestamp_in_story": "",
+                "description": plot,
+                "characters_involved": [],
+            })
+
+        # 伏笔：大纲里规划的伏笔直接种下（状态 planted）
+        fs = (outline.get("foreshadowing") or "").strip()
+        if fs:
+            facts["foreshadows"].append({
+                "description": fs,
+                "planted_chapter": chapter_id,
+                "status": "planted",
+                "related_characters": [],
+            })
+
+        if not facts["timeline_events"] and not facts["foreshadows"]:
+            return
+
+        try:
+            # 幂等：先清该章旧的「大纲种子」事实，再写入，避免重生成时堆积
+            self._memory._archive.delete_chapter_facts(chapter_id)
+            self._memory._archive.apply_facts(chapter_id, facts)
+            # 爽点日志（P3-12：写作自动检索规避重复套路，近 20 章已用爽点类型）
+            # 覆盖所有网文爽点章节类型（不仅是 CORE_BEAT_TYPES 4 种）
+            ct = str(outline.get("chapter_type", ""))
+            ALL_BEAT_TYPES = {
+                "growth_upgrade", "face_slap_hide", "crisis_survival", "opportunity_luck",
+                "competitive_game", "tame_beast", "devour_refine", "golden_finger",
+            }
+            if ct in ALL_BEAT_TYPES:
+                try:
+                    self._memory._archive.log_plot_beat(chapter_id, ct)
+                except Exception:
+                    pass
+            # 女性角色支线（P3-12：跨卷不丢女主剧情，自动检测+更新 female_arc）
+            try:
+                self._upsert_female_arc_from_outline(chapter_id, outline)
+            except Exception:
+                pass
+            logger.info(f"第{chapter_id}章大纲已写入档案（本地构建，无 LLM 调用）")
+        except Exception as e:
+            logger.warning(f"第{chapter_id}章大纲写档案失败（忽略）: {e}")
+
+    def _upsert_female_arc_from_outline(self, chapter_id: int, outline: dict) -> None:
+        """从大纲中检测女性角色出场并自动更新 female_arc 表（零 LLM，纯文本匹配）。
+
+        检测逻辑：
+        1. 从档案库获取已知女性角色名
+        2. 扫描本章大纲的 title / core_events / plot_summary 是否含女性角色名
+        3. 若命中，用 plot_summary 作为 arc_summary upsert 到 female_arc 表
+        """
+        if not self._memory or not getattr(self._memory, "_archive", None):
+            return
+        try:
+            # 收集所有已知女性角色名（role 含「女」或 name 含常见女性标识）
+            female_names: set[str] = set()
+            for c in self._memory._archive.get_all_characters():
+                if "女" in (c.role or ""):
+                    if c.name:
+                        female_names.add(c.name)
+                    for a in (c.aliases or []):
+                        if a:
+                            female_names.add(a)
+            if not female_names:
+                return
+
+            # 扫描大纲文本
+            blob = " ".join([
+                str(outline.get("title", "")),
+                str(outline.get("core_events", "")),
+                str(outline.get("plot_summary", "")),
+            ])
+
+            matched = {fn for fn in female_names if fn and fn in blob}
+            if not matched:
+                return
+
+            # 用本章概要作为弧光进展摘要
+            arc_summary = (outline.get("plot_summary") or outline.get("core_events") or "").strip()[:200]
+            for fname in matched:
+                self._memory._archive.upsert_female_arc(
+                    female_name=fname,
+                    arc_summary=arc_summary,
+                    chapter_id=chapter_id,
+                )
+                logger.debug(f"第{chapter_id}章 female_arc 已更新: {fname} -> {arc_summary[:50]}")
+        except Exception as e:
+            logger.warning(f"第{chapter_id}章 female_arc 更新失败: {e}")
+
+    def _seed_archive_from_init_texts(
+        self, worldview: str, character: str, outline: str, synopsis: str
+    ):
+        """项目初始化完成后，从生成的世界观/角色/总纲/简介中提取结构化事实并写入档案库。
+
+        使档案在第一章规划前就有「已确立的设定/人物/主线规划」可用，
+        确保后续章节大纲基于真实 canon 而非空白生成。
+        """
+        if not self._memory or not getattr(self._memory, "_archive", None):
+            return
+
+        try:
+            resp = self._llm.chat(
+                messages=[{
+                    "role": "user",
+                    "content": INIT_ARCHIVE_SEED_PROMPT.format(
+                        worldview=worldview[:3000],
+                        character=character[:2000],
+                        outline=outline[:3000],
+                        synopsis=synopsis[:1000],
+                    )
+                }],
+                temperature=0.2,
+                max_tokens=3000,
+            )
+            # 解析 JSON
+            clean = resp.strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                clean = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+            data = json.loads(clean)
+            # 构造 facts 并写入
+            facts = {
+                "world_settings": data.get("world_settings", []),
+                "characters": data.get("characters", []),
+                "foreshadows": [],
+                "timeline_events": data.get("timeline_events", []),
+            }
+            # 用 chapter_id=0 表示初始化阶段的档案（不会被后续章节 commit 的 delete_chapter_facts 清除）
+            self._memory._archive.delete_chapter_facts(0)
+            self._memory._archive.apply_facts(0, facts)
+            logger.info(f"项目初始化档案播种完成: "
+                        f"{len(facts['world_settings'])} 条设定, "
+                        f"{len(facts['characters'])} 个人物, "
+                        f"{len(facts['timeline_events'])} 条主线事件")
+        except Exception as e:
+            logger.warning(f"项目初始化档案播种失败（不阻塞）: {e}")
+
+    def _calc_chapter_position(self, chapter_id: int) -> str:
+        """计算本章在全书中位置（供节奏规划参考）。"""
+        try:
+            # 卷结构
+            from novelforge.core.pipeline import volumes as vol_mod
+            vols = vol_mod.load_volumes(self._project_root)
+            cur_vol = vol_mod.get_volume_for_chapter(vols, chapter_id) if vols else None
+            # 已有章节数量（已生成正文或大纲的）
+            chs = self.get_chapter_outlines() or []
+            existing_ids = sorted({ol.get("chapter_id", 0) for ol in chs})
+            max_existing = max(existing_ids) if existing_ids else 0
+            parts = []
+            if cur_vol:
+                vs = cur_vol.get("start_chapter", 1)
+                ve = cur_vol.get("end_chapter", 999)
+                offset = chapter_id - vs + 1
+                total_in_vol = ve - vs + 1
+                parts.append(f"当前卷：第{vs}-{ve}章（共{total_in_vol}章），本章为卷内第{offset}章")
+                # 距卷末提示
+                remain = ve - chapter_id
+                if remain >= 0:
+                    parts.append(f"距本卷结束还有约{remain}章")
+                    if remain <= 10:
+                        parts.append("提示：距卷末不远，应开始铺垫卷高潮/质变")
+            else:
+                parts.append(f"当前第{chapter_id}章，尚无卷结构")
+            parts.append(f"全书最高章节号：第{max_existing}章")
+            # 连续主线推进计数器：从已有大纲中向上追溯
+            consecutive_main = 0
+            for cid in range(chapter_id - 1, 0, -1):
+                ol = next((o for o in chs if o.get("chapter_id") == cid), None)
+                if ol and ol.get("chapter_type") == "main_plot":
+                    consecutive_main += 1
+                else:
+                    break
+            if consecutive_main > 0:
+                parts.append(f"【节奏】此前已连续 {consecutive_main} 章主线推进（修炼/打脸/奇遇/危机/竞技等爽点类型不计数）")
+                if consecutive_main >= 3:
+                    parts.append("【强制规则】已连续 3 章主线推进，本章必须为缓冲/氛围/内心独白/过渡等非主线类型")
+            return "，".join(parts)
+        except Exception as e:
+            return f"第{chapter_id}章"
+
+    def _format_outlines_as_adjacent(self, outlines: list[dict], label_prefix: str = "相邻章节") -> str:
+        """将大纲列表格式化为相邻大纲描述字符串（供分批生成时衔接用）。"""
+        if not outlines:
+            return ""
+        parts = []
+        for ol in outlines:
+            cid = ol.get("chapter_id", 0)
+            parts.append(f"【{label_prefix} 第{cid}章《{ol.get('title', '')}》】")
+            if ol.get("chapter_type_label"):
+                parts.append(f"  类型: {ol['chapter_type_label']}")
+            if ol.get("core_events"):
+                parts.append(f"  核心事件: {ol['core_events']}")
+            if ol.get("ending_hook"):
+                parts.append(f"  结尾钩子: {ol['ending_hook']}")
+            if ol.get("plot_summary"):
+                parts.append(f"  情节概要: {ol['plot_summary']}")
+            parts.append("")
+        return "\n".join(parts)
+
+    def save_chapter_outlines(self, outlines: list[dict]):
+        """保存章节大纲到项目文件。"""
+        outlines_dir = Path(self._project_root) / ".novelforge"
+        outlines_dir.mkdir(parents=True, exist_ok=True)
+        path = outlines_dir / "chapter_outlines.json"
+
+        # 合并已有大纲
+        existing = {}
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for ol in data:
+                        existing[ol["chapter_id"]] = ol
+            except Exception:
+                pass
+
+        # 更新/新增
+        for ol in outlines:
+            cid = ol.get("chapter_id", 0)
+            existing[cid] = ol
+
+        all_outlines = sorted(existing.values(), key=lambda x: x.get("chapter_id", 0))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(all_outlines, f, ensure_ascii=False, indent=2)
+
+        logger.debug(f"章节大纲已保存: {len(all_outlines)} 条")
+
+    def get_chapter_outlines(self) -> list[dict]:
+        """读取所有章节大纲。"""
+        path = Path(self._project_root) / ".novelforge" / "chapter_outlines.json"
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def get_chapter_outline(self, chapter_id: int) -> dict | None:
+        """读取单个章节大纲。"""
+        outlines = self.get_chapter_outlines()
+        for ol in outlines:
+            if ol.get("chapter_id") == chapter_id:
+                return ol
+        return None
+
+    def confirm_chapter_outline(self, chapter_id: int, confirmed: bool = True):
+        """确认/取消确认章节大纲。"""
+        outlines = self.get_chapter_outlines()
+        for ol in outlines:
+            if ol.get("chapter_id") == chapter_id:
+                ol["confirmed"] = confirmed
+                break
+        outlines_dir = Path(self._project_root) / ".novelforge"
+        outlines_dir.mkdir(parents=True, exist_ok=True)
+        path = outlines_dir / "chapter_outlines.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(outlines, f, ensure_ascii=False, indent=2)
+
+    def fix_all_titles(self) -> dict:
+        """全量修复章节标题，消除占位符（第N章 / 新章节 / 新章节2 等）。
+
+        修复规则（按优先级）：
+          1. 大纲标题有效（非占位）→ 用大纲标题覆盖文件头。
+          2. 文件头标题有效但大纲是占位 → 把文件头回填到大纲。
+          3. 文件头与大纲都是占位、但正文存在 → 用 AI 从正文生成标题（消耗 API）。
+          4. 都没有可用标题 → 跳过，列入 skipped。
+
+        仅对「已存在正文文件」的章节重写文件头；不会为纯大纲章节凭空创建正文文件。
+        返回报告：{fixed, generated, skipped, outline_updated}（均为章节号列表）。
+        """
+        outlines = {ol.get("chapter_id"): ol for ol in self.get_chapter_outlines()}
+        chapters_dir = Path(self._project_root) / "chapters"
+        file_ids = set()
+        if chapters_dir.exists():
+            for path in chapters_dir.glob("chapter_*.md"):
+                try:
+                    file_ids.add(int(path.stem.split("_")[1]))
+                except Exception:
+                    pass
+        all_ids = sorted(file_ids | set(outlines.keys()))
+
+        fixed, generated, skipped, outline_updated = [], [], [], []
+
+        for cid in all_ids:
+            ol = outlines.get(cid)
+            outline_title = (ol.get("title") or "").strip() if ol else ""
+            outline_ok = bool(outline_title) and not self._is_placeholder_title(outline_title, cid)
+
+            path = chapters_dir / f"chapter_{cid:04d}.md"
+            file_title = ""
+            body = ""
+            if path.exists():
+                try:
+                    raw = path.read_text(encoding="utf-8")
+                    file_title, body = self._strip_title_from_text(raw, cid)
+                except Exception:
+                    body = ""
+
+            # 决定目标标题
+            target = None
+            if outline_ok:
+                target = outline_title
+            elif body and body.strip() and not self._is_placeholder_title(file_title, cid):
+                target = file_title
+            elif body and body.strip():
+                # 文件头与大纲都是占位，但有正文 → 调用 AI 生成
+                try:
+                    gen = self.auto_chapter_title(body[:1500])
+                    if gen and not self._is_placeholder_title(gen, cid):
+                        target = gen
+                        generated.append(cid)
+                        if ol is not None:
+                            ol["title"] = gen
+                            if cid not in outline_updated:
+                                outline_updated.append(cid)
+                except Exception:
+                    pass
+
+            if not target:
+                skipped.append(cid)
+                continue
+
+            # 已存在正文文件才重写文件头（不为纯大纲章节创建空文件）
+            if path.exists() and file_title != target:
+                try:
+                    self._save_chapter_text(cid, target, body if body else "")
+                    if cid not in fixed:
+                        fixed.append(cid)
+                except Exception:
+                    pass
+            # 大纲占位 → 用目标标题回填大纲
+            if ol is not None and (ol.get("title") or "").strip() != target:
+                ol["title"] = target
+                if cid not in outline_updated:
+                    outline_updated.append(cid)
+                if cid not in fixed:
+                    fixed.append(cid)
+
+        if outline_updated:
+            self.save_chapter_outlines(list(outlines.values()))
+
+        return {
+            "fixed": fixed,
+            "generated": generated,
+            "skipped": skipped,
+            "outline_updated": outline_updated,
+        }
+
+    def update_chapter_outline(self, chapter_id: int, outline: dict):
+        """更新单个章节大纲（用户修改后保存）。"""
+        outlines = self.get_chapter_outlines()
+        found = False
+        for i, ol in enumerate(outlines):
+            if ol.get("chapter_id") == chapter_id:
+                outlines[i] = {**ol, **outline, "chapter_id": chapter_id}
+                found = True
+                break
+        if not found:
+            outline["chapter_id"] = chapter_id
+            outlines.append(outline)
+            outlines.sort(key=lambda x: x.get("chapter_id", 0))
+
+        outlines_dir = Path(self._project_root) / ".novelforge"
+        outlines_dir.mkdir(parents=True, exist_ok=True)
+        path = outlines_dir / "chapter_outlines.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(outlines, f, ensure_ascii=False, indent=2)
+
+    def delete_chapter_outline(self, chapter_id: int):
+        """删除单个章节大纲。"""
+        outlines = self.get_chapter_outlines()
+        outlines = [ol for ol in outlines if ol.get("chapter_id") != chapter_id]
+        outlines_dir = Path(self._project_root) / ".novelforge"
+        outlines_dir.mkdir(parents=True, exist_ok=True)
+        path = outlines_dir / "chapter_outlines.json"
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(outlines, f, ensure_ascii=False, indent=2)
+
+    # ============================================================
+    # 插入章节（随时插入 + 前后章钩子调整）
+    # ============================================================
+
+    def insert_chapter(
+        self,
+        insert_pos: int,
+        book_name: str = "",
+        genre: str = "",
+        tone: str = "",
+        user_request: str = "",
+        adjust_adjacent: bool = True,
+    ) -> dict:
+        """
+        在 insert_pos 位置插入新章，原 insert_pos 及之后所有章节编号顺延 +1。
+
+        机械层（无 AI，必定执行）：
+        1. 降序重命名 chapters/chapter_XXXX.md（并更新文件首行标题的章节号）
+        2. 降序重命名 .novelforge/summaries/chapter_XXXX.json（并更新内部 chapter_id 字段）
+        3. chapter_outlines.json 中所有 chapter_id >= insert_pos 的条目 +1
+        4. RAG chunks 表中所有 chapter_id >= insert_pos 的条目 +1 并重建 BM25 索引
+        5. 在第 insert_pos 章创建一个空的占位章节文件，供用户直接写作
+
+        AI 层（adjust_adjacent 且项目已完成基础初始化时执行）：
+        - 调用 INSERT_CHAPTER_ADJUST_PROMPT，由 AI 规划新插入章的大纲，
+          并修订前章 ending_hook 与后章 opening_hook，使钩子链重新衔接，
+          防止插入后上下文不一致。AI 失败不影响机械层结果。
+
+        Args:
+            insert_pos: 插入位置（新章将成为第 insert_pos 章；1 表示插到最前）
+            book_name/genre/tone: 供 AI 生成大纲使用
+            user_request: 用户对插入章节的内容要求（可选）
+            adjust_adjacent: 是否调用 AI 调整前后章钩子
+
+        Returns:
+            dict: {
+                "new_chapter_id": int,
+                "shifted_count": int,        # 被顺延的章节数
+                "adjusted": bool,            # 是否成功进行了 AI 钩子调整
+                "new_outline": dict | None,  # 新章大纲（AI 调整后）
+                "error": str,                # 机械层错误信息（正常为空）
+            }
+        """
+        result: dict = {
+            "new_chapter_id": insert_pos,
+            "shifted_count": 0,
+            "adjusted": False,
+            "new_outline": None,
+            "error": "",
+        }
+
+        if insert_pos < 1:
+            result["error"] = "插入位置必须 >= 1"
+            return result
+
+        try:
+            root = Path(self._project_root)
+            chapters_dir = root / "chapters"
+            summaries_dir = root / ".novelforge" / "summaries"
+            summaries_dir.mkdir(parents=True, exist_ok=True)
+
+            # 计算当前最大章节号（取文件/大纲/摘要三者的并集，避免遗漏）
+            max_id = 0
+            if chapters_dir.exists():
+                for p in chapters_dir.glob("chapter_*.md"):
+                    try:
+                        max_id = max(max_id, int(p.stem.split("_")[1]))
+                    except (IndexError, ValueError):
+                        continue
+            for ol in self.get_chapter_outlines():
+                max_id = max(max_id, ol.get("chapter_id", 0))
+            if summaries_dir.exists():
+                for p in summaries_dir.glob("chapter_*.json"):
+                    try:
+                        max_id = max(max_id, int(p.stem.split("_")[1]))
+                    except (IndexError, ValueError):
+                        continue
+
+            if insert_pos > max_id + 1:
+                # 允许插到末尾（max_id+1）；超出则校正为末尾
+                insert_pos = max_id + 1
+                result["new_chapter_id"] = insert_pos
+
+            # ---- 0. 顺延卷边界（基于当前章节状态，先于文件重命名） ----
+            try:
+                from novelforge.core.pipeline import volumes as vol_mod
+                vols = vol_mod.get_volumes_or_default(self._project_root)
+                vols = vol_mod.shift_for_insert(vols, insert_pos)
+                vol_mod.save_volumes(self._project_root, vols)
+            except Exception as e:
+                logger.warning(f"插入章节时卷边界调整失败（忽略）: {e}")
+
+            # ---- 1 & 2. 降序重命名章节文件与摘要文件（避免覆盖） ----
+            for cid in range(max_id, insert_pos - 1, -1):
+                # 章节正文文件
+                old_ch = chapters_dir / f"chapter_{cid:04d}.md"
+                if old_ch.exists():
+                    try:
+                        text = old_ch.read_text(encoding="utf-8")
+                        lines = text.split("\n")
+                        if lines and lines[0].lstrip().startswith("#"):
+                            # 仅替换首行章节号（如「# 第5章 ...」→「# 第6章 ...」）
+                            lines[0] = re.sub(
+                                r"^#\s*第\d+章", f"# 第{cid + 1}章", lines[0], count=1
+                            )
+                        new_ch = chapters_dir / f"chapter_{cid + 1:04d}.md"
+                        new_ch.write_text("\n".join(lines), encoding="utf-8")
+                        old_ch.unlink()
+                    except Exception as e:
+                        logger.warning(f"顺延第{cid}章正文文件失败: {e}")
+
+                # 摘要文件
+                old_sum = summaries_dir / f"chapter_{cid:04d}.json"
+                if old_sum.exists():
+                    try:
+                        data = json.loads(old_sum.read_text(encoding="utf-8"))
+                        data["chapter_id"] = cid + 1
+                        new_sum = summaries_dir / f"chapter_{cid + 1:04d}.json"
+                        new_sum.write_text(
+                            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+                        )
+                        old_sum.unlink()
+                    except Exception as e:
+                        logger.warning(f"顺延第{cid}章摘要文件失败: {e}")
+
+            result["shifted_count"] = max(0, max_id - insert_pos + 1)
+
+            # ---- 3. 顺延大纲 chapter_id ----
+            outlines = self.get_chapter_outlines()
+            shifted = False
+            for ol in outlines:
+                if ol.get("chapter_id", 0) >= insert_pos:
+                    ol["chapter_id"] = ol["chapter_id"] + 1
+                    shifted = True
+            if shifted:
+                self._save_outlines_direct(outlines)
+
+            # ---- 4. 顺延 RAG chunks 的 chapter_id ----
+            if self._memory and getattr(self._memory, "rag", None):
+                try:
+                    conn = self._memory.rag._conn
+                    conn.execute(
+                        "UPDATE chunks SET chapter_id = chapter_id + 1 WHERE chapter_id >= ?",
+                        (insert_pos,),
+                    )
+                    conn.commit()
+                    self._memory.rag._rebuild_bm25()
+                    logger.info(f"已顺延 RAG 向量章节号 >= {insert_pos}")
+                except Exception as e:
+                    logger.warning(f"顺延 RAG 章节号失败: {e}")
+
+            # ---- 5. 创建新空章节占位文件 ----
+            new_title = f"新章节{insert_pos}"
+            self._save_chapter_text(insert_pos, new_title, "")
+            logger.info(f"已在第{insert_pos}章位置插入空占位章节")
+
+            # ---- AI 层：调整前后章钩子 + 生成新章大纲 ----
+            if adjust_adjacent and self.has_foundation():
+                try:
+                    new_outline = self._adjust_outlines_after_insert(
+                        insert_pos, book_name, genre, tone, user_request
+                    )
+                    if new_outline:
+                        result["adjusted"] = True
+                        result["new_outline"] = new_outline
+                except Exception as e:
+                    logger.warning(f"插入章节 AI 钩子调整失败，已保留机械层结果: {e}")
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"插入章节失败: {e}")
+
+        return result
+
+    def _adjust_outlines_after_insert(
+        self,
+        insert_pos: int,
+        book_name: str,
+        genre: str,
+        tone: str,
+        user_request: str,
+    ) -> dict | None:
+        """
+        插入章节后，调用 AI 规划新章大纲并修订前后章钩子。
+
+        返回新章大纲 dict（含 chapter_id = insert_pos）；失败抛出异常。
+        """
+        prev_pos = insert_pos - 1
+        next_pos = insert_pos + 1
+
+        prev_ol = self.get_chapter_outline(prev_pos) if prev_pos >= 1 else None
+        next_ol = self.get_chapter_outline(next_pos)
+
+        # 位置感知：开篇章 vs 书中插入 vs 末尾插入
+        is_first = (prev_pos < 1)
+        has_next = next_ol is not None
+        prev_label = "前章" if is_first else f"第 {prev_pos} 章"
+        prev_tag = "无前文（本书开篇）" if is_first else f"第 {prev_pos} 章"
+        next_tag = f"第 {next_pos} 章，原第 {insert_pos} 章" if has_next else f"第 {next_pos} 章（无后文，本书/本段在此收尾）"
+        if is_first:
+            position_note = (
+                f"【本章定位】新插入的第 {insert_pos} 章是整本小说的【开篇第一章】，"
+                "它的前面没有任何章节。你必须从零展开故事（可建立世界观、引入主角、"
+                "抛出全书第一个冲突或悬念）。新章的『开篇钩子』是全书第一个钩子，"
+                "禁止出现『承接前章』『如前文所述』等承接性表述，它应当是全新的开始。"
+            )
+            opening_hook_guidance = "全书第一个开篇钩子（从零展开，制造悬念/冲突/强画面）"
+        else:
+            position_note = (
+                f"【本章定位】新章插入在第 {prev_pos} 章之后、第 {next_pos} 章之前。"
+                f"它必须紧接第 {prev_pos} 章的【结尾】之后自然展开，"
+                f"承接第 {prev_pos} 章新的结尾钩子；不要重述第 {prev_pos} 章已有内容，"
+                "也不要脱离前情另起炉灶。"
+            )
+            opening_hook_guidance = (
+                f"承接第 {prev_pos} 章新的结尾钩子，自然过渡到本章"
+            )
+        if has_next:
+            ending_hook_guidance = f"引出第 {next_pos} 章新的开篇钩子"
+        else:
+            ending_hook_guidance = "强有力的收尾钩子（本段/全书收束，抛出悬念，不指向具体后章）"
+
+        outline = self._read_outline()
+        worldview = self._read_setting("worldview")
+        character = self._read_setting("character_main")
+
+        messages = [{
+            "role": "user",
+            "content": INSERT_CHAPTER_ADJUST_PROMPT.format(
+                insert_pos=insert_pos,
+                next_pos=next_pos,
+                prev_pos=prev_pos,
+                prev_label=prev_label,
+                prev_tag=prev_tag,
+                next_tag=next_tag,
+                position_note=position_note,
+                opening_hook_guidance=opening_hook_guidance,
+                ending_hook_guidance=ending_hook_guidance,
+                outline=(outline or "（未生成总纲）")[:3000],
+                worldview=(worldview or "（未生成世界观）")[:1500],
+                character=(character or "（未生成主角设定）")[:1500],
+                prev_title=(prev_ol or {}).get("title", f"第{prev_pos}章") if prev_ol else f"第{prev_pos}章（无前文）",
+                prev_type=(prev_ol or {}).get("chapter_type_label", "") if prev_ol else "",
+                prev_core_events=(prev_ol or {}).get("core_events", "") if prev_ol else "",
+                prev_ending_hook=(prev_ol or {}).get("ending_hook", "") if prev_ol else "",
+                next_title=(next_ol or {}).get("title", f"第{next_pos}章") if next_ol else f"第{next_pos}章（无后文）",
+                next_type=(next_ol or {}).get("chapter_type_label", "") if next_ol else "",
+                next_core_events=(next_ol or {}).get("core_events", "") if next_ol else "",
+                next_opening_hook=(next_ol or {}).get("opening_hook", "") if next_ol else "",
+                user_request=user_request or "（用户无特殊要求，请根据上下文合理安排新章内容）",
+            )
+        }]
+
+        response = self._llm.chat(messages, temperature=0.7, max_tokens=2000)
+
+        # 解析 JSON
+        clean = response.strip()
+        if clean.startswith("```"):
+            lines = clean.split("\n")
+            clean = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+        data = json.loads(clean)
+
+        new_chapter = data.get("new_chapter", {}) or {}
+
+        # 新章大纲（强制 chapter_id = insert_pos）
+        new_outline = {
+            "chapter_id": insert_pos,
+            "title": (new_chapter.get("title") or f"第{insert_pos}章").strip() or f"第{insert_pos}章",
+            "chapter_type": new_chapter.get("chapter_type", "main_plot"),
+            "chapter_type_label": new_chapter.get("chapter_type_label", "主线推进"),
+            "core_events": new_chapter.get("core_events", ""),
+            "opening_hook": new_chapter.get("opening_hook", ""),
+            "ending_hook": new_chapter.get("ending_hook", ""),
+            "foreshadowing": new_chapter.get("foreshadowing", "none"),
+            "plot_summary": new_chapter.get("plot_summary", ""),
+            "confirmed": False,
+        }
+        # 字段兜底
+        if not new_outline["title"]:
+            new_outline["title"] = f"第{insert_pos}章"
+        if not new_outline["chapter_type_label"]:
+            new_outline["chapter_type_label"] = "主线推进"
+
+        self.update_chapter_outline(insert_pos, new_outline)
+
+        # 修订前章 ending_hook（衔接到新章）
+        prev_hook = data.get("prev_ending_hook", "")
+        if prev_ol and prev_hook and prev_hook.strip():
+            prev_ol["ending_hook"] = prev_hook.strip()
+            self.update_chapter_outline(prev_pos, prev_ol)
+
+        # 修订后章 opening_hook（承接新章结尾）
+        next_hook = data.get("next_opening_hook", "")
+        if next_ol and next_hook and next_hook.strip():
+            next_ol["opening_hook"] = next_hook.strip()
+            self.update_chapter_outline(next_pos, next_ol)
+
+        logger.info(f"插入章节 AI 调整完成：新章大纲已生成，前后章钩子已更新")
+        return new_outline
+
+    def _save_outlines_direct(self, outlines: list[dict]):
+        """直接覆盖写入 chapter_outlines.json（不做合并，用于编号顺延等场景）。"""
+        outlines_dir = Path(self._project_root) / ".novelforge"
+        outlines_dir.mkdir(parents=True, exist_ok=True)
+        path = outlines_dir / "chapter_outlines.json"
+        sorted_outs = sorted(outlines, key=lambda x: x.get("chapter_id", 0))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted_outs, f, ensure_ascii=False, indent=2)
+
+    def delete_chapter_content(self, chapter_id: int):
+        """
+        删除章节正文文件及关联记忆数据（RAG 向量、摘要、checkpoint）。
+
+        用于「删除正文重新生成大纲」场景：
+        - 删除 chapters/chapter_XXXX.md
+        - 删除 RAG 向量数据
+        - 删除摘要数据
+        - 删除 checkpoint
+        - 不会删除大纲（大纲由调用方单独处理）
+        """
+        # 1. 删除正文文件
+        chapter_path = Path(self._project_root) / "chapters" / f"chapter_{chapter_id:04d}.md"
+        if chapter_path.exists():
+            chapter_path.unlink()
+            logger.info(f"已删除章节正文: {chapter_path}")
+
+        # 2. 删除 RAG 向量数据
+        if self._memory:
+            try:
+                self._memory.rag.delete_chapter(chapter_id)
+                logger.info(f"已删除第{chapter_id}章 RAG 向量数据")
+            except Exception as e:
+                logger.warning(f"删除第{chapter_id}章 RAG 数据失败: {e}")
+
+        # 3. 删除摘要
+        if self._memory:
+            try:
+                self._memory._summary.delete_summary(chapter_id)
+                logger.info(f"已删除第{chapter_id}章摘要")
+            except Exception as e:
+                logger.warning(f"删除第{chapter_id}章摘要失败: {e}")
+
+        # 4. 删除 checkpoint
+        self._clear_checkpoint(chapter_id)
+
+        # 5. 顺延卷边界（最佳努力；删除不重排后续章节编号，空洞由 assign 兜底）
+        try:
+            from novelforge.core.pipeline import volumes as vol_mod
+            vols = vol_mod.get_volumes_or_default(self._project_root)
+            vols = vol_mod.shift_for_delete(vols, chapter_id)
+            vol_mod.save_volumes(self._project_root, vols)
+        except Exception as e:
+            logger.warning(f"删除章节时卷边界调整失败（忽略）: {e}")
+
+    def revise_chapter(
+        self,
+        chapter_id: int,
+        chapter_title: str,
+        chapter_text: str,
+        revision_request: str,
+        chapter_type: str = "",
+        prev_chapter_ending: str = "",
+        next_chapter_beginning: str = "",
+        chapter_outline: str = "",
+        recent_summaries: str = "",
+        on_stream: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """
+        基于用户修改意见，AI 局部修订章节正文。
+
+        不是重写，而是保留好的部分，只调整有问题的部分。
+        修订时传入前后章节上下文，确保衔接性。
+
+        Args:
+            chapter_id: 章节号
+            chapter_title: 章节标题
+            chapter_text: 原章节正文
+            revision_request: 用户修改意见
+            chapter_type: 章节类型（可选）
+            prev_chapter_ending: 前一章结尾正文（衔接用）
+            next_chapter_beginning: 后一章开头正文（衔接用）
+            chapter_outline: 本章大纲（可选）
+            recent_summaries: 近期章节摘要
+            on_stream: 流式输出回调
+
+        Returns:
+            修订后的完整章节正文
+        """
+        type_label = ""
+        if chapter_type:
+            from novelforge.core.pipeline.prompts import CHAPTER_TYPES
+            type_label = CHAPTER_TYPES.get(chapter_type, chapter_type)
+
+        messages = [{
+            "role": "user",
+            "content": CHAPTER_REVISION_PROMPT.format(
+                chapter_title=chapter_title,
+                chapter_type=type_label or "未指定",
+                chapter_outline=chapter_outline or "（无大纲）",
+                prev_chapter_ending=prev_chapter_ending[-2000:] if prev_chapter_ending else "（第一章，无前文）",
+                next_chapter_beginning=next_chapter_beginning[:1500] if next_chapter_beginning else "（无后文）",
+                recent_summaries=recent_summaries or "（暂无前文摘要）",
+                chapter_text=chapter_text,
+                revision_request=revision_request,
+            )
+        }]
+
+        if on_stream:
+            full_text = ""
+            for chunk in self._llm.chat_stream(
+                messages=messages,
+                temperature=0.6,
+                max_tokens=self._llm.config.max_tokens,
+            ):
+                full_text += chunk
+                on_stream(chunk)
+            cleaned, _ = self._clean_english_words(full_text)
+            return cleaned
+        else:
+            raw = self._llm.chat(
+                messages=messages,
+                temperature=0.6,
+                max_tokens=self._llm.config.max_tokens,
+            )
+            cleaned, _ = self._clean_english_words(raw)
+            return cleaned
+
+    def revise_segment(
+        self,
+        chapter_title: str,
+        segment: str,
+        context_before: str,
+        context_after: str,
+        revision_request: str,
+        on_stream: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        """位置精确的局部修订：只改写章节中的【待修订片段】，不触碰前后文。
+
+        与 revise_chapter（整章重写）不同，本方法接收一段待改写的文本及其前后
+        上下文（仅用于连贯参考），AI 只返回修订后的该片段本身，由调用方 splice
+        回原文对应位置。token 消耗极小，适合“选中某段 / 光标附近 → 局部改”。
+
+        Args:
+            chapter_title: 章节标题
+            segment: 待修订的原片段文本
+            context_before: 片段之前的正文（连贯参考，AI 不改）
+            context_after: 片段之后的正文（连贯参考，AI 不改）
+            revision_request: 用户的局部修改意见
+            on_stream: 流式输出回调（返回的是片段本身）
+
+        Returns:
+            修订后的片段文本（不含前后文）
+        """
+        messages = [{
+            "role": "user",
+            "content": SEGMENT_REVISION_PROMPT.format(
+                chapter_title=chapter_title,
+                context_before=context_before or "（无前文）",
+                segment=segment,
+                context_after=context_after or "（无后文）",
+                revision_request=revision_request,
+            )
+        }]
+
+        if on_stream:
+            full_text = ""
+            for chunk in self._llm.chat_stream(
+                messages=messages,
+                temperature=0.6,
+                max_tokens=self._llm.config.max_tokens,
+            ):
+                full_text += chunk
+                on_stream(chunk)
+            cleaned, _ = self._clean_english_words(full_text)
+            return cleaned
+        else:
+            raw = self._llm.chat(
+                messages=messages,
+                temperature=0.6,
+                max_tokens=self._llm.config.max_tokens,
+            )
+            cleaned, _ = self._clean_english_words(raw)
+            return cleaned
+
+    def refresh_chapter_archive(self, chapter_id: int):
+        """修订片段后重提本章事实并更新档案库，确保改后设定同步。"""
+        if not self._memory:
+            return
+        try:
+            text = self._read_chapter_text(chapter_id)
+            if not text or not text.strip():
+                return
+            title = ""
+            ol = self.get_chapter_outline(chapter_id)
+            if ol:
+                title = ol.get("title", "")
+            # 轻量提交：只做事实提取 + 档案更新，跳过摘要/RAG/备份
+            self._memory._archive.delete_chapter_facts(chapter_id)
+            from novelforge.core.pipeline.prompts import FACT_EXTRACTION_PROMPT
+            char_list = []
+            try:
+                chars = self._memory._archive.get_all_characters()
+                char_list = [c.name for c in chars if c.name]
+            except Exception:
+                pass
+            resp = self._llm.chat(messages=[{
+                "role": "user",
+                "content": FACT_EXTRACTION_PROMPT.format(
+                    char_list=json.dumps(char_list, ensure_ascii=False),
+                    chapter_text=text,
+                )
+            }], temperature=0.2, max_tokens=3000)
+            import json as _json
+            clean = resp.strip()
+            if clean.startswith("```"):
+                lines = clean.split("\n")
+                clean = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+            facts = _json.loads(clean)
+            self._memory._archive.apply_facts(chapter_id, facts)
+            logger.info(f"第{chapter_id}章修订后档案已同步")
+        except Exception as e:
+            logger.warning(f"第{chapter_id}章修订后档案同步失败（不阻塞）: {e}")
+
+    # ============================================================
+    # 情节 / 设定合理性校验
+    # ============================================================
+
+    def validate_chapter(self, chapter_id: int, config: dict | None = None) -> dict:
+        """审查单章的情节合理性与设定一致性，返回结构化报告 dict。
+
+        报告字段：
+            passed: bool
+            score: int (0-100)
+            issues: list[{type, severity, description, location, fix_suggestion}]
+            real_world_concerns: list[{topic, claim_in_text, concern, is_factual_error, needs_user_confirmation}]
+            overall_suggestion: str
+        调用方可据 passed / real_world_concerns 决定是否自动重写。
+        """
+        config = config or {}
+        text = self._read_chapter_text(chapter_id)
+        if not text or not text.strip():
+            return {
+                "passed": True, "score": 100, "issues": [],
+                "real_world_concerns": [], "overall_suggestion": "",
+                "error": "no_text",
+            }
+
+        meta = self._read_project_meta()
+        book_name = meta.get("name", "")
+        genre = config.get("genre") or meta.get("genre", "") or ""
+        tone = meta.get("tone", "") or ""
+
+        worldview = self._read_setting("worldview")
+        synopsis = self._read_synopsis()
+        master = self._read_outline()
+
+        outlines = self.get_chapter_outlines()
+        this_outline = next((o for o in outlines if o.get("chapter_id") == chapter_id), None)
+        chapter_outline_str = self._format_outline(this_outline) if this_outline else "（无大纲）"
+        chapter_title = (this_outline or {}).get("title") or f"第{chapter_id}章"
+
+        try:
+            recent = self._memory._summary.get_recent_summaries(chapter_id, 6)
+        except Exception:
+            recent = []
+        recent_str = self._format_summaries(recent) if recent else "（暂无前文摘要）"
+
+        adjacent = self._get_adjacent_outlines_str(chapter_id, chapter_id) or "（无相邻章节大纲）"
+
+        prompt = PLAUSIBILITY_REVIEW_PROMPT.format(
+            book_name=book_name,
+            genre=genre,
+            tone=tone,
+            chapter_id=chapter_id,
+            chapter_title=chapter_title,
+            chapter_outline=chapter_outline_str,
+            worldview=worldview or "（未定义世界观）",
+            synopsis=synopsis or "（无简介）",
+            master_outline=master or "（无总纲）",
+            recent_summaries=recent_str,
+            adjacent_outlines=adjacent,
+            chapter_text=text,
+        )
+
+        max_retries = 1  # LLM 偶发格式错误，重试一次即可恢复
+        report = None
+        last_raw = ""
+        for attempt in range(max_retries + 1):
+            try:
+                resp = self._llm.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=config.get("max_tokens", 2500),
+                )
+            except Exception as e:
+                return {
+                    "passed": True, "score": 0, "issues": [],
+                    "real_world_concerns": [], "overall_suggestion": "",
+                    "error": f"llm_error: {e}",
+                }
+            last_raw = resp or ""
+            report = self._parse_json_block(resp)
+            if report.get("error") != "parse_error":
+                break
+            # 重试时追加提示让模型输出更规范的 JSON
+            if attempt < max_retries:
+                prompt += "\n\n（请务必只输出标准 JSON，不要添加任何 markdown 标记、说明文字或代码块标记。）"
+
+        # 所有尝试都失败，返回带原始响应片段的错误报告便于排查
+        if not report or report.get("error") == "parse_error":
+            preview = (last_raw[:200].replace("\n", " ")) if len(last_raw) > 10 else "(空响应)"
+            return {
+                "passed": True, "score": 0, "issues": [],
+                "real_world_concerns": [], "overall_suggestion": "",
+                "error": f"parse_error（模型返回了非JSON格式内容，预览：{preview}）",
+            }
+        report.setdefault("passed", True)
+        report.setdefault("issues", [])
+        report.setdefault("real_world_concerns", [])
+        report.setdefault("score", 0)
+        report.setdefault("overall_suggestion", "")
+
+        issues = report.get("issues", []) or []
+        # 按校验等级（严重度门槛）过滤：只有达到门槛的问题才算"不通过"，
+        # 低于门槛的软性问题（如 low 级节奏建议）只进入报告，不触发重写，避免无限改写循环。
+        level = (config or {}).get("validation_level", "normal")
+        serious = issues_at_or_above(issues, level)
+        report["serious_issues"] = serious
+        # 若 LLM 漏判，有达到门槛的 issues 即视为不通过
+        report["passed"] = len(serious) == 0
+        return report
+
+    # ============================================================
+    # 全书一致性重写
+    # ============================================================
+
+    def _strip_title_from_text(self, text: str, chapter_id: int) -> tuple[str, str]:
+        """从章节文件中分离标题与正文。返回 (title, body)。
+
+        title 为不含 '第N章' 前缀的纯标题；body 为正文（去掉首行标题行）。
+        重写后由 _save_chapter_text 重新拼回 '# 第N章 title'。
+        """
+        parts = text.split("\n", 1)
+        first = parts[0].lstrip("#").strip() if parts else ""
+        title = re.sub(r"^第\s*\d+\s*章\s*", "", first).strip()
+        body = parts[1].lstrip("\n") if len(parts) > 1 else text
+        return (title or f"第{chapter_id}章"), body
+
+    # ============================================================
+    # 正文后处理（英文清洗）
+    # ============================================================
+
+    # 常见英文→中文替换表（玄幻/网文场景）
+    _ENGLISH_REPLACE_MAP: dict[str, str] = {
+        "parchment": "羊皮卷", "scroll": "卷轴", "mana": "法力", "magic": "法术",
+        "level": "境界", "level up": "突破", "upgrade": "进阶", "skill": "功法",
+        "quest": "任务", "dungeon": "秘境", "raid": "围攻", "boss": "首领",
+        "clan": "家族", "guild": "商会", "party": "队伍", "NPC": "修士",
+        "elite": "精锐", "epic": "史诗级", "legendary": "传说级",
+        "HP": "气血", "MP": "法力", "CD": "冷却", "buff": "加持", "debuff": "减益",
+        "cooldown": "冷却时间", "respawn": "复活", "spawn": "出现",
+        "loot": "战利品", "drop": "掉落", "inventory": "行囊",
+        "soul": "灵魂", "spirit": "元神", "core": "丹田", "meridian": "经脉",
+        "realm": "境界", "cultivation": "修炼", "martial artist": "武者",
+        "sword intent": "剑意", "sword qi": "剑气", "divine sense": "神识",
+        "nascent soul": "元婴", "golden core": "金丹", "foundation": "筑基",
+        "qi condensation": "炼气", "body tempering": "锻体",
+        # 通用
+        "however": "然而", "therefore": "因此", "moreover": "此外",
+        "nevertheless": "尽管如此", "nonetheless": "虽然如此",
+    }
+
+    @staticmethod
+    def _clean_english_words(text: str) -> tuple[str, list[str]]:
+        """检测并清洗正文中混入的英文单词。
+
+        作为 prompt 纯中文约束的安全网。匹配规则：
+        - 独立英文单词（被中文/标点包围或位于行首尾）
+        - 不匹配已知的合法英文缩写/专有名词模式
+        - 使用替换表优先翻译，无翻译则用「〔英文原文〕」标记提醒用户
+
+        Returns:
+            (cleaned_text, found_words) — 清洗后的文本和发现的英文词列表
+        """
+        import unicodedata
+
+        if not text:
+            return text, []
+
+        found: list[str] = []
+        cleaned = text
+
+        # 1. 先做精确替换表匹配（全词匹配，大小写不敏感）
+        for en, zh in WritingPipeline._ENGLISH_REPLACE_MAP.items():
+            pattern = re.compile(r'(?<![\w])' + re.escape(en) + r'(?![\w])', re.IGNORECASE)
+            match = pattern.search(cleaned)
+            if match:
+                found.append(f"{match.group()} → {zh}")
+                cleaned = pattern.sub(zh, cleaned)
+
+        # 2. 匹配剩余独立英文单词（未被替换表覆盖的）
+        # 匹配: 被中文/标点/空格包围的连续英文字母串（长度≥2）
+        english_word_pattern = re.compile(
+            r'(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\s，。！？、；：""''（）【】《》…—～·])'
+            r'[A-Za-z]{2,}'
+            r'(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\s，。！？、；：""''（）【】《》…—～·]|$)'
+        )
+
+        def _mark_en(match):
+            word = match.group()
+            if word.lower() not in {k.lower() for k in WritingPipeline._ENGLISH_REPLACE_MAP}:
+                found.append(word)
+                return f"〔{word}〕"
+            return match.group()  # 已被替换表处理过的不重复标记
+
+        cleaned = english_word_pattern.sub(_mark_en, cleaned)
+
+        # 3. 行首/段首的独立英文单词
+        leading_english = re.compile(r'^([ \t]*)([A-Za-z]{3,})(?=[\u4e00-\u9fff\s，。])', re.MULTILINE)
+
+        def _mark_leading(m):
+            prefix, word = m.group(1), m.group(2)
+            if word.lower() not in {k.lower() for k in WritingPipeline._ENGLISH_REPLACE_MAP}:
+                found.append(word)
+                return prefix + f"〔{word}〕"
+            return m.group()
+
+        cleaned = leading_english.sub(_mark_leading, cleaned)
+
+        if found:
+            from novelforge.utils.logger import logger
+            logger.warning(f"正文后处理发现并处理了 {len(found)} 处英文混入: {found[:10]}")
+
+        return cleaned, found
+
+    # 顶部章节标题行识别（模型常多写 # 第N章 ... / 第N章 ... / 纯 # 标题）
+    _LEADING_TITLE_RE = re.compile(
+        r'^\s*#+\s*第?\s*[0-9零一二三四五六七八九十百千两]+\s*章'   # "# 第21章 ..." / "第21章 ..."
+        r'|^\s*第\s*[0-9零一二三四五六七八九十百千两]+\s*章'         # "第21章 ..."（无 #）
+        r'|^\s*#+\s*\S.*$'                                          # 顶部普通 markdown 标题行
+    )
+
+    @staticmethod
+    def _strip_leading_titles(text: str) -> str:
+        """剥离正文开头的章节标题行。
+
+        规范标题由 _save_chapter_text 统一在文件顶部写入（# 第N章 标题），
+        正文内不应再出现标题行；但模型仍常多写 # 第N章 ... 甚至重复标题，
+        导致「章节标题」与「正文里的题目」不一致。此处把顶部（允许中间有空行）
+        连续的标题行全部剥掉，只保留纯正文。仅处理顶部标题行，
+        正文内部的标题/分隔不受影响。
+        """
+        if not text:
+            return text
+        lines = text.split("\n")
+        n = len(lines)
+        idx = 0
+        # 跳过顶部空行
+        while idx < n and (lines[idx] or "").strip() == "":
+            idx += 1
+        # 跳过连续的标题行（允许标题行之间夹空行）
+        while idx < n:
+            if WritingPipeline._LEADING_TITLE_RE.match(lines[idx] or ""):
+                idx += 1
+                while idx < n and (lines[idx] or "").strip() == "":
+                    idx += 1
+            else:
+                break
+        return "\n".join(lines[idx:]).lstrip("\n")
+
+    # ============================================================
+    # 质量审查通道（独立调用，不进写作提示词）
+    # 功能1 英文清洗 -> 见 _clean_english_words（代码安全网）+ L0 硬约束
+    # 功能2 反AI味   -> L0 硬约束 + 下方代码检测 + L2 细则模块
+    # 功能3 钩子审查 -> 下方 LLM 钩子审查（接入闲置的 HOOK_REVIEW_PROMPT）
+    # 功能7 自动去重 -> 下方代码查重（与邻近章节 n-gram 重叠）
+    # ============================================================
+
+    # 反 AI 味套话检测（代码层，零成本；与 L0 约束互为呼应）
+    _AI_FLAVOR_PHRASES: tuple[str, ...] = (
+        "不禁", "竟然", "嘴角微微上扬", "心中暗想", "一股寒意涌上心头",
+        "眼中闪过一丝", "不由得", "仿佛感受到了", "莫名其妙地", "说不清的",
+        "一股说不清", "空气中弥漫着", "不知为何", "莫名地", "似乎感到",
+    )
+
+    _AI_FLAVOR_RE = re.compile(
+        r"(不禁|竟然|嘴角微微上扬|心中暗想|一股寒意涌上心头|眼中闪过一丝|不由得|"
+        r"仿佛感受到了|莫名其妙地|说不清的|一股说不清|空气中弥漫着|不知为何|莫名地|似乎感到)"
+    )
+
+    def _ai_flavor_check(self, text: str) -> dict:
+        """检测正文中是否出现 AI 味套话（代码层，零 LLM 成本）。"""
+        if not text:
+            return {"found": [], "count": 0}
+        found = self._AI_FLAVOR_RE.findall(text)
+        # 去重保序
+        seen = set()
+        uniq = []
+        for w in found:
+            if w not in seen:
+                seen.add(w)
+                uniq.append(w)
+        return {"found": uniq, "count": len(found)}
+
+    @staticmethod
+    def _shingles(text: str, n: int = 4) -> set:
+        """将正文切分为 n 字碎片集合（去标点空白），用于查重重叠率计算。"""
+        import re as _re
+        cleaned = _re.sub(r"\s+", "", text)
+        cleaned = _re.sub(r"\W+", "", cleaned)  # \W 去除所有标点与空白，保留中英文与数字
+        if len(cleaned) < n:
+            return {cleaned} if cleaned else set()
+        return {cleaned[i:i + n] for i in range(len(cleaned) - n + 1)}
+
+    def _dedup_check(self, chapter_id: int, text: str) -> dict:
+        """与邻近章节（前 1-2 章）做 n-gram 重叠查重（功能7，代码层）。"""
+        prev_texts: list[str] = []
+        for d in (chapter_id - 1, chapter_id - 2):
+            if d >= 1:
+                t = self._read_chapter_text(d)
+                if t and t.strip():
+                    prev_texts.append(t)
+        if not prev_texts:
+            return {"enabled": False, "repeat_ratio": 0.0, "samples": []}
+
+        cur = self._shingles(text, 4)
+        if not cur:
+            return {"enabled": True, "repeat_ratio": 0.0, "samples": []}
+
+        prev_set: set = set()
+        for pt in prev_texts:
+            prev_set |= self._shingles(pt, 4)
+
+        samples: list[str] = []
+        overlap = 0
+        for sh in cur:
+            if sh in prev_set:
+                overlap += 1
+                if len(samples) < 5:
+                    samples.append(sh)
+        ratio = overlap / len(cur) if cur else 0.0
+        return {"enabled": True, "repeat_ratio": round(ratio, 3), "samples": samples}
+
+    def run_quality_review(self, chapter_id: int, text: str, config: dict | None = None) -> dict:
+        """质量审查通道：钩子审查（LLM）+ 去重（代码）+ 反AI味（代码）。
+
+        返回结构化报告，写入 PipelineResult.quality_report。
+        非阻断：默认只报告；若 config.quality_auto_fix=True 且发现可自动修复项，
+        由调用方决定是否单轮修订。
+        """
+        config = config or {}
+        report: dict = {
+            "hook": None, "dedup": None, "ai_flavor": None,
+            "auto_fixable": False, "suggestions": [],
+        }
+
+        # 1) 钩子审查（LLM）— 功能3：接入此前闲置的 HOOK_REVIEW_PROMPT
+        if config.get("enable_quality_review", False):
+            try:
+                resp = self._llm.chat(
+                    messages=[{"role": "user", "content": HOOK_REVIEW_PROMPT.format(chapter_text=text)}],
+                    temperature=0.2,
+                    max_tokens=800,
+                )
+                hook = self._parse_json_block(resp)
+                report["hook"] = hook
+                if hook:
+                    if not hook.get("has_ending_hook"):
+                        report["auto_fixable"] = True
+                        report["suggestions"].append(
+                            "本章结尾缺少钩子，请补强结尾钩子（悬念 / 疑问 / 反转 / 微妙变化）"
+                        )
+                    if not hook.get("has_opening_hook"):
+                        report["suggestions"].append("本章开篇缺少抓人的钩子，建议增强开篇")
+            except Exception as e:
+                logger.warning(f"钩子审查失败(忽略): {e}")
+
+        # 2) 去重审查（代码）— 功能7
+        report["dedup"] = self._dedup_check(chapter_id, text)
+
+        # 3) 反 AI 味（代码）— 功能2
+        report["ai_flavor"] = self._ai_flavor_check(text)
+        if report["ai_flavor"].get("found"):
+            report["suggestions"].append(
+                "检测到 AI 味套话：" + "、".join(report["ai_flavor"]["found"][:5])
+            )
+
+        return report
+
+    def _auto_fix_quality(
+        self,
+        chapter_id: int,
+        chapter_title: str,
+        chapter_text: str,
+        quality: dict,
+        config: dict,
+    ) -> str:
+        """依据质量审查建议单轮修订（仅在 quality_auto_fix=True 时调用）。"""
+        this_outline = next(
+            (o for o in self.get_chapter_outlines() if o.get("chapter_id") == chapter_id), None
+        )
+        chapter_type = (this_outline or {}).get("chapter_type", "")
+        prev_ending = self._get_previous_chapter_ending(chapter_id)
+        next_begin = self._get_next_chapter_beginning(chapter_id)
+        chapter_outline_str = self._format_outline(this_outline) if this_outline else "（无大纲）"
+        try:
+            recent = self._memory._summary.get_recent_summaries(chapter_id, 6)
+        except Exception:
+            recent = []
+        recent_str = self._format_summaries(recent) if recent else "（暂无前文摘要）"
+
+        revision_request = (
+            "；".join(quality.get("suggestions", []))
+            + "；请仅针对性补强上述问题，保持其余正文不变，不要大段重写。"
+        )
+        return self.revise_chapter(
+            chapter_id=chapter_id,
+            chapter_title=chapter_title,
+            chapter_text=chapter_text,
+            revision_request=revision_request,
+            chapter_type=chapter_type,
+            prev_chapter_ending=prev_ending,
+            next_chapter_beginning=next_begin,
+            chapter_outline=chapter_outline_str,
+            recent_summaries=recent_str,
+        )
+
+    def _format_established_facts(self, chapter_id: int) -> str:
+        """汇总第 1..chapter_id-1 章已确立的事实，供重写时锚定（不吃书）。
+
+        由于全书重写按章顺序进行、每章提交后记忆即更新，
+        重写第 N 章时此处反映的是前 N-1 章已重写确立的人物/设定/伏笔/时间线。
+        """
+        blocks: list[str] = []
+        try:
+            chars = self._memory._archive.get_all_characters()
+            if chars:
+                lines = []
+                for c in chars:
+                    desc = c.description or ""
+                    state = c.current_state or ""
+                    ab = "、".join(c.abilities) if c.abilities else ""
+                    line = f"- {c.name}（{c.role or '角色'}）：{desc}"
+                    if state:
+                        line += f"；当前状态：{state}"
+                    if ab:
+                        line += f"；能力：{ab}"
+                    lines.append(line)
+                blocks.append("【已登场人物与状态】\n" + "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"读取已确立人物失败: {e}")
+
+        try:
+            ws = self._memory._archive.get_world_settings()
+            if ws:
+                lines = [f"- {w.name}（{w.category}）：{w.description}" for w in ws]
+                blocks.append("【已确立世界观设定】\n" + "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"读取已确立设定失败: {e}")
+
+        try:
+            fs = self._memory._archive.get_foreshadows()
+            if fs:
+                state_map = {"planted": "埋设", "advanced": "推进", "resolved": "回收"}
+                lines = [
+                    f"- {f.description}（状态：{state_map.get(f.status, f.status)}）"
+                    for f in fs
+                ]
+                blocks.append("【伏笔状态】\n" + "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"读取已确立伏笔失败: {e}")
+
+        try:
+            tl = self._memory._archive.get_timeline((1, max(1, chapter_id - 1)))
+            if tl:
+                lines = [f"- 第{t.chapter_id}章：{t.event}（{t.timestamp_in_story or ''}）" for t in tl[-12:]]
+                blocks.append("【时间线（近期）】\n" + "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"读取已确立时间线失败: {e}")
+
+        return "\n\n".join(blocks) if blocks else "（暂无已确立事实）"
+
+    def _build_consistency_request(self, report: dict) -> str:
+        """把校验报告转化为修订意见文本（逐条必须解决）。
+
+        优先使用达到校验等级门槛的 serious_issues，避免把低严重度的软性
+        建议（如轻微节奏）也算作必须修改项，从而陷入反复改写。
+        """
+        issues = report.get("serious_issues") or report.get("issues", []) or []
+        type_names = {
+            "plot": "情节逻辑", "logic": "逻辑", "character": "人物",
+            "worldview": "世界观", "continuity": "衔接", "motivation": "人物动机",
+            "world_logic": "事物规律", "pacing": "节奏·信息揭露",
+        }
+        if not issues:
+            return ("本章校验未发现明确问题。请通读并优化：保持节奏舒缓、设定与人物动机一致、"
+                    "重要信息随情节渐进揭示（给读者猜测空间，关键节点再落地），避免一次性说尽或夸张演绎。")
+        lines = []
+        for i, it in enumerate(issues, 1):
+            t = type_names.get(it.get("type", ""), it.get("type", ""))
+            sev = it.get("severity", "")
+            desc = it.get("description", "")
+            fix = it.get("fix_suggestion", "")
+            loc = it.get("location", "")
+            line = f"{i}. 【必须解决】【{t}·{sev}】{desc}"
+            if loc:
+                line += f"\n   问题位置：{loc}"
+            if fix:
+                line += f"\n   推荐改法：{fix}"
+            lines.append(line)
+        head = ("以下是本章校验发现的问题，请【逐条】实际消解每一个，不得遗漏或用含糊措辞带过：\n")
+        tail = ("\n\n硬性要求：\n"
+                "1. 对上面每一条都给出具体修改，并确认该问题已消除；\n"
+                "2. 修改后自查：不得新增设定矛盾、逻辑漏洞、人物动机不一致、前后衔接断裂、"
+                "节奏失衡（信息一次性说尽或关键永不落地）；\n"
+                "3. 允许为彻底解决问题对相关段落做必要改写，但保持文风与前后连贯。")
+        return head + "\n".join(lines) + tail
+
+    def revise_novel_full(
+        self,
+        config: dict | None = None,
+        on_progress: Optional[Callable[[int, int, int, str], None]] = None,
+        on_chapter: Optional[Callable[[int, int, int, dict], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+        iterations: int = 1,
+        verify: bool = True,
+    ) -> dict:
+        """全书一致性重写：逐章校验 → 依据已确立事实修订 → 覆盖 → 提交记忆。
+
+        用于修复情节/设定/衔接/动机/节奏问题，并保证重写不"吃书"（与已确立事实一致）。
+        开始前重置派生记忆，逐章提交时幂等清空旧派生事实，避免百万字级重复提交导致记忆膨胀崩溃。
+
+        Args:
+            config: 写作/校验配置（含 max_tokens、rag_top_k 等）
+            on_progress: (chapter_id, index, total, stage) 进度回调
+            on_chapter: (chapter_id, index, total, result_dict) 单章完成回调
+            stop_check: 返回 True 时中断（可取消）
+            verify: 重写完成后是否二次校验生成前后对比
+            iterations: 单章最大重写轮数（>1 即迭代重写：每轮复校不过关则带问题清单再写，直到通过或达上限）
+
+        Returns:
+            {"success", "stopped", "total", "before_pass", "before_total",
+             "after_pass", "after_total", "results": [...]}
+        """
+        config = config or {}
+        stats = self.get_project_stats()
+        chapters = sorted(stats.get("chapters", []), key=lambda c: c["chapter_id"])
+        total = len(chapters)
+        if total == 0:
+            return {"success": False, "error": "no_chapters", "total": 0, "results": []}
+
+        # 开始前重置派生记忆（防膨胀，且保证重建于已确立事实之上）
+        try:
+            self._memory.reset_derived_memory()
+            logger.info("全书重写：已重置派生记忆")
+        except Exception as e:
+            logger.error(f"重置派生记忆失败（继续）: {e}")
+
+        before: dict[int, dict] = {}
+        results: list[dict] = []
+        stopped = False
+
+        for idx, ch in enumerate(chapters):
+            cid = ch["chapter_id"]
+            if stop_check and stop_check():
+                stopped = True
+                results.append({"chapter_id": cid, "stopped": True})
+                break
+
+            raw = self._read_chapter_text(cid)
+            title, body = self._strip_title_from_text(raw, cid)
+            if not body.strip():
+                results.append({"chapter_id": cid, "skipped": True, "reason": "empty"})
+                if on_chapter:
+                    on_chapter(cid, idx + 1, total, results[-1])
+                continue
+
+            try:
+                # 本章共用上下文（锚定已确立事实，不吃书）
+                this_outline = next(
+                    (o for o in self.get_chapter_outlines() if o.get("chapter_id") == cid), None
+                )
+                chapter_outline_str = self._format_outline(this_outline) if this_outline else "（无大纲）"
+                chapter_type = (this_outline or {}).get("chapter_type", "")
+                try:
+                    recent = self._memory._summary.get_recent_summaries(cid, 6)
+                except Exception:
+                    recent = []
+                recent_str = self._format_summaries(recent) if recent else "（暂无前文摘要）"
+                established = self._format_established_facts(cid)
+                prev_ending = self._get_previous_chapter_ending(cid)
+                next_begin = self._get_next_chapter_beginning(cid)
+
+                max_rounds = max(1, int(config.get("iterations") or iterations))
+                final_text = body
+                final_report = None
+                for rnd in range(1, max_rounds + 1):
+                    # 当前正文：第1轮=磁盘原文，后续轮=上一轮重写结果
+                    if rnd == 1:
+                        cur_title, cur_body = title, body
+                    else:
+                        cur_raw = self._read_chapter_text(cid)
+                        cur_title, cur_body = self._strip_title_from_text(cur_raw, cid)
+                    if not cur_body.strip():
+                        break
+
+                    # 1) 校验（基于当前 memory：前文已重写章节记忆已提交）
+                    if on_progress:
+                        on_progress(cid, idx + 1, total, f"校验{rnd}/{max_rounds}")
+                    report = self.validate_chapter(cid, config)
+                    final_report = report
+                    if rnd == 1:
+                        before[cid] = report
+                    if report.get("passed"):
+                        # 本轮通过：保留当前正文，结束迭代
+                        final_text = cur_body
+                        break
+
+                    # 2) 构建修订请求（逐条解决问题）
+                    revision_request = self._build_consistency_request(report)
+                    full_request = (
+                        revision_request
+                        + "\n\n【一致性修订准则】人物动机与主观事物规律必须自洽；重要设定与信息随主角经历"
+                          "渐进揭示，给读者猜测空间，关键节点再落地，禁止一次性说尽或夸张演绎。"
+                        + "\n\n【已确立事实（务必遵守，不得与之一致性冲突 / 吃书）】\n" + established
+                        + (f"\n\n【迭代轮次 {rnd}/{max_rounds}】本章已重写 {rnd - 1} 次仍残留上述问题，"
+                           "本轮必须逐条解决且不得引入新问题。" if rnd > 1 else "")
+                    )
+
+                    # 3) 修订（仅得正文，不提交记忆）
+                    if on_progress:
+                        on_progress(cid, idx + 1, total, f"重写{rnd}/{max_rounds}")
+                    new_text = self.revise_chapter(
+                        chapter_id=cid,
+                        chapter_title=cur_title,
+                        chapter_text=cur_body,
+                        revision_request=full_request,
+                        chapter_type=chapter_type,
+                        prev_chapter_ending=prev_ending,
+                        next_chapter_beginning=next_begin,
+                        chapter_outline=chapter_outline_str,
+                        recent_summaries=recent_str,
+                    )
+                    # 4) 覆盖正文文件（供下一轮校验读取）
+                    self._save_chapter_text(cid, cur_title, new_text)
+                    final_text = new_text
+
+                # 5) 提交记忆（幂等：先清该章旧派生事实，避免重复提交膨胀）
+                try:
+                    self._memory._archive.delete_chapter_facts(cid)
+                except Exception:
+                    pass
+                commit_report = self._memory.commit_chapter(
+                    chapter_id=cid, chapter_title=title, chapter_text=final_text, config=config
+                )
+
+                _b = before.get(cid) or final_report or {}
+                res = {
+                    "chapter_id": cid,
+                    "title": title,
+                    "rounds": rnd,
+                    "passed_before": _b.get("passed", True),
+                    "score_before": _b.get("score", 0),
+                    "issues_before": len(_b.get("issues", [])),
+                    "commit_success": commit_report.success,
+                    "word_count": len(final_text),
+                }
+                results.append(res)
+                if on_chapter:
+                    on_chapter(cid, idx + 1, total, res)
+            except Exception as e:
+                logger.error(f"第{cid}章一致性重写失败（跳过，继续后续章节）: {e}")
+                results.append({"chapter_id": cid, "error": str(e)})
+                if on_chapter:
+                    on_chapter(cid, idx + 1, total, {"chapter_id": cid, "error": str(e)})
+
+        # 6) 可选二次校验，生成前后对比
+        after: dict[int, dict] = {}
+        if verify and not stopped:
+            for idx, ch in enumerate(chapters):
+                cid = ch["chapter_id"]
+                if any(r.get("chapter_id") == cid and r.get("skipped") for r in results):
+                    continue
+                if on_progress:
+                    on_progress(cid, idx + 1, total, "复校")
+                after[cid] = self.validate_chapter(cid, config)
+
+        before_pass = sum(1 for r in before.values() if r.get("passed"))
+        after_pass = sum(1 for r in after.values() if r.get("passed")) if after else None
+        return {
+            "success": True,
+            "stopped": stopped,
+            "total": total,
+            "before_pass": before_pass,
+            "before_total": len(before),
+            "after_pass": after_pass,
+            "after_total": len(after),
+            "results": results,
+        }
+
+    def _read_project_meta(self) -> dict:
+        """读取 .novelforge/project.json 的元信息。"""
+        p = Path(self._project_root) / ".novelforge" / "project.json"
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _read_synopsis(self) -> str:
+        """读取小说简介（保存在 project.json 的 description 字段）。"""
+        return self._read_project_meta().get("description", "") or ""
+
+    def _read_chapter_text(self, chapter_id: int) -> str:
+        """读取章节正文文件。"""
+        p = Path(self._project_root) / "chapters" / f"chapter_{chapter_id:04d}.md"
+        if not p.exists():
+            return ""
+        try:
+            return p.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+    def _format_outline(self, ol: dict | None) -> str:
+        """把单章大纲格式化为可读文本。"""
+        if not ol:
+            return "（无大纲）"
+        parts = []
+        if ol.get("title"):
+            parts.append(f"标题：{ol['title']}")
+        if ol.get("chapter_type_label"):
+            parts.append(f"类型：{ol['chapter_type_label']}")
+        if ol.get("core_events"):
+            parts.append(f"核心事件：{ol['core_events']}")
+        if ol.get("plot_summary"):
+            parts.append(f"情节概要：{ol['plot_summary']}")
+        if ol.get("opening_hook"):
+            parts.append(f"开篇钩子：{ol['opening_hook']}")
+        if ol.get("ending_hook"):
+            parts.append(f"结尾钩子：{ol['ending_hook']}")
+        if ol.get("foreshadowing"):
+            parts.append(f"伏笔：{ol['foreshadowing']}")
+        return "\n".join(parts) if parts else "（无大纲）"
+
+    def _format_summaries(self, summaries: list) -> str:
+        """把近期摘要格式化为可读文本。"""
+        lines = []
+        for s in summaries:
+            title = getattr(s, "title", "") or ""
+            one_line = getattr(s, "one_line_summary", "") or ""
+            lines.append(f"第{getattr(s, 'chapter_id', 0)}章《{title}》：{one_line}")
+        return "\n".join(lines)
+
+    def _parse_json_block(self, text: str) -> dict:
+        """从 LLM 回复中健壮提取 JSON 对象。
+
+        策略：
+        1. 去除 ```json / ``` 代码块标记
+        2. 直接 json.loads 尝试
+        3. 找首尾 { } 截取再解析
+        4. 截断修复：若尾部被截断（缺 } 或 ]），尝试补齐后重试
+        """
+        t = (text or "").strip()
+        if "```" in t:
+            for part in t.split("```"):
+                part = part.strip()
+                # 跳过语言标记行（如 "json"）
+                if part.lower() in ("json", "javascript", ""):
+                    continue
+                if part.startswith("{"):
+                    t = part
+                    break
+
+        # 直接解析
+        try:
+            return json.loads(t)
+        except Exception:
+            pass
+
+        # 截取 { ... } 区间
+        s = t.find("{")
+        e = t.rfind("}")
+        if s != -1 and e != -1 and e > s:
+            try:
+                return json.loads(t[s:e + 1])
+            except Exception:
+                pass
+
+        # 截断修复：模型输出在 max_tokens 处截断导致 JSON 不完整
+        # 检测是否以未闭合的 [ 或 { 结尾，尝试补齐
+        if s != -1:
+            raw = t[s:]
+            stripped = raw.rstrip()
+            # 统计需要补的闭合括号
+            open_braces = raw.count("{") - raw.count("}")
+            open_brackets = raw.count("[") - raw.count("]")
+            if open_braces > 0 or open_brackets > 0:
+                repair = stripped + "]" * max(0, open_brackets) + "}" * max(0, open_braces)
+                try:
+                    return json.loads(repair)
+                except Exception:
+                    pass
+
+        return {"passed": True, "issues": [], "real_world_concerns": [], "overall_suggestion": "", "error": "parse_error"}
+
+    def _get_next_chapter_beginning(self, current_chapter: int) -> str:
+        """获取下一章开头正文（用于修订时衔接）。"""
+        next_path = Path(self._project_root) / "chapters" / f"chapter_{current_chapter + 1:04d}.md"
+        if not next_path.exists():
+            return ""
+        try:
+            text = next_path.read_text(encoding="utf-8")
+            return text[:1500] if len(text) > 1500 else text
+        except Exception:
+            return ""
+
+    def _get_next_chapter_outline_str(self, current_chapter: int) -> str:
+        """
+        获取下一章的大纲描述（用于写作时衔接）。
+
+        让 AI 知道下一章的走向，从而在本章结尾做好铺垫。
+        """
+        outlines = self.get_chapter_outlines()
+        if not outlines:
+            return ""
+
+        for ol in outlines:
+            cid = ol.get("chapter_id", 0)
+            if cid == current_chapter + 1:
+                parts = []
+                parts.append(f"下一章（第{cid}章《{ol.get('title', '')}》）方向：")
+                if ol.get("chapter_type_label"):
+                    parts.append(f"  类型: {ol['chapter_type_label']}")
+                if ol.get("core_events"):
+                    parts.append(f"  核心事件: {ol['core_events']}")
+                if ol.get("opening_hook"):
+                    parts.append(f"  开篇钩子: {ol['opening_hook']}")
+                if ol.get("plot_summary"):
+                    parts.append(f"  情节概要: {ol['plot_summary']}")
+                return "\n".join(parts)
+        return ""
+
+    def _get_adjacent_outlines_str(
+        self, start_chapter: int, end_chapter: int, exclude_ids: set = None
+    ) -> str:
+        """
+        获取与给定章节范围相邻的章节大纲描述（前一章和后一章）。
+
+        用于重新生成部分章节大纲时，让 AI 知道前后章节的情节方向，
+        避免新生成的大纲与已有大纲产生矛盾。
+        """
+        exclude_ids = exclude_ids or set()
+        outlines = self.get_chapter_outlines()
+        if not outlines:
+            return ""
+
+        parts = []
+        for ol in outlines:
+            cid = ol.get("chapter_id", 0)
+            if cid in exclude_ids:
+                continue
+            # 前一章大纲
+            if cid == start_chapter - 1:
+                parts.append(f"【前一章 第{cid}章《{ol.get('title', '')}》】")
+                parts.append(f"  类型: {ol.get('chapter_type_label', '')}")
+                parts.append(f"  核心事件: {ol.get('core_events', '')}")
+                parts.append(f"  结尾钩子: {ol.get('ending_hook', '')}")
+                parts.append(f"  情节概要: {ol.get('plot_summary', '')}")
+                parts.append("")
+            # 后一章大纲
+            elif cid == end_chapter + 1:
+                parts.append(f"【后一章 第{cid}章《{ol.get('title', '')}》】")
+                parts.append(f"  类型: {ol.get('chapter_type_label', '')}")
+                parts.append(f"  核心事件: {ol.get('core_events', '')}")
+                parts.append(f"  开篇钩子: {ol.get('opening_hook', '')}")
+                parts.append(f"  情节概要: {ol.get('plot_summary', '')}")
+                parts.append("")
+
+        return "\n".join(parts) if parts else ""
+
+    def has_foundation(self) -> bool:
+        """检查项目是否已完成AI基础初始化（世界观+总纲已生成）。"""
+        outline = self._read_outline()
+        worldview = self._read_setting("worldview")
+        return bool(outline and worldview)
+
+    def get_project_stats(self) -> dict:
+        """获取项目统计数据。"""
+        chapters_dir = Path(self._project_root) / "chapters"
+        chapters = sorted(chapters_dir.glob("chapter_*.md")) if chapters_dir.exists() else []
+        total_words = 0
+        chapter_list = []
+        for path in chapters:
+            try:
+                text = path.read_text(encoding="utf-8")
+                wc = len([c for c in text if c.strip()])
+                total_words += wc
+                first_line = text.split("\n")[0]
+                title = first_line.replace("#", "").strip()
+                chapter_id = int(path.stem.split("_")[1])
+                chapter_list.append({
+                    "chapter_id": chapter_id,
+                    "title": title,
+                    "word_count": wc,
+                    "path": str(path),
+                })
+            except Exception:
+                continue
+
+        # 读取设定文件
+        settings_dir = Path(self._project_root) / "settings"
+        settings_list = []
+        if settings_dir.exists():
+            settings_list = [f.stem for f in settings_dir.glob("*.md")]
+
+        # 读取大纲文件
+        outline_dir = Path(self._project_root) / "outline"
+        outlines_list = []
+        if outline_dir.exists():
+            outlines_list = [f.stem for f in outline_dir.glob("*.md")]
+
+        return {
+            "total_chapters": len(chapters),
+            "total_words": total_words,
+            "chapters": chapter_list,
+            "settings": settings_list,
+            "outlines": outlines_list,
+            "project_root": self._project_root,
+        }
+
+    # ============================================================
+    # 写作流水线
+    # ============================================================
+
+    # ===== 卷管理（范围元数据） =====
+
+    def get_volumes(self) -> list[dict]:
+        """读取卷定义（原始，可能为空）。"""
+        from novelforge.core.pipeline import volumes as vol_mod
+        return vol_mod.load_volumes(self._project_root)
+
+    def get_volumes_or_default(self) -> list[dict]:
+        from novelforge.core.pipeline import volumes as vol_mod
+        return vol_mod.get_volumes_or_default(self._project_root)
+
+    def save_volumes(self, volumes: list[dict]) -> None:
+        from novelforge.core.pipeline import volumes as vol_mod
+        vol_mod.save_volumes(self._project_root, volumes)
+
+    def add_volume(self, title: str, theme: str, start_chapter: int,
+                   end_chapter: int, summary: str = "") -> dict:
+        """新增一卷并保存，返回新建的卷 dict。"""
+        from novelforge.core.pipeline import volumes as vol_mod
+        vols = vol_mod.load_volumes(self._project_root)
+        new_id = max([v.get("id", 0) for v in vols], default=0) + 1
+        vol = {
+            "id": new_id,
+            "title": title,
+            "theme": theme,
+            "start_chapter": start_chapter,
+            "end_chapter": end_chapter,
+            "summary": summary,
+        }
+        vols.append(vol)
+        vol_mod.save_volumes(self._project_root, vols)
+        return vol
+
+    def update_volume(self, volume_id: int, **fields) -> None:
+        """更新指定卷的字段（title/theme/start_chapter/end_chapter/summary）。"""
+        from novelforge.core.pipeline import volumes as vol_mod
+        vols = vol_mod.load_volumes(self._project_root)
+        for v in vols:
+            if v.get("id") == volume_id:
+                for k in ("title", "theme", "start_chapter", "end_chapter", "summary"):
+                    if k in fields:
+                        v[k] = fields[k]
+                break
+        vol_mod.save_volumes(self._project_root, vols)
+
+    def delete_volume(self, volume_id: int) -> None:
+        """删除指定卷（按 id）。"""
+        from novelforge.core.pipeline import volumes as vol_mod
+        vols = [v for v in vol_mod.load_volumes(self._project_root) if v.get("id") != volume_id]
+        vol_mod.save_volumes(self._project_root, vols)
+
+    def delete_volume_with_chapters(self, volume_id: int) -> list[int]:
+        """删除指定卷及其范围内的全部章节（正文 + 大纲 + 关联记忆）。
+
+        返回实际被删除的章节 id 列表。卷只按 id 匹配真实卷定义，
+        不会误删「未分卷」这类合成卷。
+        """
+        from novelforge.core.pipeline import volumes as vol_mod
+        vols = vol_mod.load_volumes(self._project_root)
+        vol = next((v for v in vols if v.get("id") == volume_id), None)
+        if not vol:
+            logger.warning(f"未找到卷 id={volume_id}，无法删除")
+            return []
+
+        start = int(vol.get("start_chapter", 1) or 1)
+        end = int(vol.get("end_chapter", start) or start)
+
+        # 收集范围内真实存在的章节（正文文件 或 大纲 任一存在即算）
+        chapters_dir = Path(self._project_root) / "chapters"
+        existing_ids: set[int] = set()
+        if chapters_dir.exists():
+            for p in chapters_dir.glob("chapter_*.md"):
+                stem = p.stem[len("chapter_"):]
+                if stem.isdigit():
+                    existing_ids.add(int(stem))
+        for ol in self.get_chapter_outlines():
+            cid = ol.get("chapter_id")
+            if isinstance(cid, int):
+                existing_ids.add(cid)
+
+        to_delete = sorted(cid for cid in existing_ids if start <= cid <= end)
+
+        for cid in to_delete:
+            try:
+                self.delete_chapter_content(cid)
+            except Exception as e:
+                logger.warning(f"删除第{cid}章正文/记忆失败: {e}")
+            try:
+                self.delete_chapter_outline(cid)
+            except Exception as e:
+                logger.warning(f"删除第{cid}章大纲失败: {e}")
+
+        # 移除卷定义
+        vols = [v for v in vols if v.get("id") != volume_id]
+        vol_mod.save_volumes(self._project_root, vols)
+        logger.info(f"已删除卷 id={volume_id} 及范围内 {len(to_delete)} 章")
+        return to_delete
+
+    def regenerate_volumes_from_master(self) -> list[dict]:
+        """从总纲（master.md）解析卷结构并保存到 volumes.json。返回解析后的卷列表。"""
+        from novelforge.core.pipeline import volumes as vol_mod
+        outline = self._read_outline()
+        if not outline:
+            raise RuntimeError("未找到故事总纲，无法生成卷结构")
+        response = self._llm.chat(
+            messages=[{
+                "role": "user",
+                "content": GENERATE_VOLUMES_PROMPT.format(outline=outline[:4000]),
+            }],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        clean = response.strip()
+        if clean.startswith("```"):
+            lines = clean.split("\n")
+            clean = "\n".join(lines[1:-1]) if lines[-1].startswith("```") else "\n".join(lines[1:])
+        import json as _json
+        vols = _json.loads(clean)
+        if not isinstance(vols, list):
+            vols = [vols]
+        norm = []
+        for i, v in enumerate(vols, 1):
+            norm.append({
+                "id": i,
+                "title": v.get("title", f"第{i}卷"),
+                "theme": v.get("theme", ""),
+                "start_chapter": int(v.get("start_chapter", 1)),
+                "end_chapter": int(v.get("end_chapter", int(v.get("start_chapter", 1)))),
+                "summary": v.get("summary", ""),
+            })
+        vol_mod.save_volumes(self._project_root, norm)
+        return norm
+
+    def write_chapter(
+        self,
+        chapter_id: int,
+        chapter_title: str,
+        writing_instruction: str,
+        config: dict,
+        on_progress: Optional[Callable[[PipelineStage], None]] = None,
+        on_stream: Optional[Callable[[str], None]] = None,
+        skip_review: bool = False,
+        outline: Optional[dict] = None,
+        problem_mode: bool = False,
+    ) -> PipelineResult:
+        """
+        执行完整写作流水线。
+
+        Args:
+            writing_instruction: 用户的故事走向/灵感指引（可以是简略的方向性描述）
+            skip_review: 跳过一致性审查（用户选择忽略时使用）
+            outline: 本章大纲 dict（可选，包含 chapter_type/core_events/hooks 等）
+        """
+        result = PipelineResult()
+        checkpoint = self._load_checkpoint(chapter_id)
+
+        try:
+            # 1. 预检
+            if on_progress:
+                on_progress(PipelineStage.PRECHECK)
+            self._precheck(chapter_id)
+
+            # 2. 上下文组装
+            if on_progress:
+                on_progress(PipelineStage.CONTEXT_ASSEMBLY)
+            memory_result = self._memory.retrieve_for_writing(chapter_id, writing_instruction, config)
+            previous_text = self._get_previous_chapter_ending(chapter_id)
+            genre = config.get("genre", "")
+            tags = self._memory.get_project_tags()
+            process_tags = self._memory.get_project_process_tags()
+
+            # 获取下一章大纲（衔接用）
+            next_outline_str = self._get_next_chapter_outline_str(chapter_id)
+
+            # 获取本章大纲钩子（精确衔接锚点）：优先用传入的 outline，否则按章号查
+            cur_outline = outline if outline else (self.get_chapter_outline(chapter_id) or {})
+            current_opening_hook = (cur_outline.get("opening_hook") or "").strip()
+            current_ending_hook = (cur_outline.get("ending_hook") or "").strip()
+            # 节奏标签：优先用大纲显式标注，否则按章节类型推断（兼容旧大纲）
+            current_rhythm = (
+                cur_outline.get("rhythm")
+                or self._infer_rhythm_from_type(cur_outline.get("chapter_type"))
+                or ""
+            )
+            current_rhythm = current_rhythm.strip()
+
+            # 2.4 大纲完整性闸门：空大纲（无核心事件/情节摘要）严禁写正文
+            #      否则会写出脱离设定的离谱剧情，并污染后续所有章节的档案（无限返工根源）
+            if self._outline_content_invalid(cur_outline):
+                result.success = False
+                result.error = (
+                    f"第{chapter_id}章大纲内容不完整（缺少核心事件/情节摘要），"
+                    f"已拒绝生成正文。请先重新生成或补全本章大纲，再执行写作。"
+                )
+                logger.error(result.error)
+                return result
+
+            context = self._assembler.assemble(
+                chapter_id=chapter_id,
+                writing_instruction=writing_instruction,
+                memory_result=memory_result,
+                previous_chapter_text=previous_text,
+                genre=genre,
+                next_chapter_outline=next_outline_str,
+                problem_mode=problem_mode,
+                current_opening_hook=current_opening_hook,
+                current_ending_hook=current_ending_hook,
+                current_rhythm=current_rhythm,
+                tags=tags,
+                process_tags=process_tags,
+            )
+            result.tokens_used = context.total_tokens
+
+            # 3. 起草
+            if on_progress:
+                on_progress(PipelineStage.DRAFTING)
+            chapter_text = checkpoint.get("chapter_text") or self._draft(context, on_stream)
+
+            # 3.5 后处理：清洗英文单词（prompt 约束的安全网）— 功能1
+            chapter_text, _en_found = self._clean_english_words(chapter_text)
+
+            # 3.6 质量审查通道（独立调用，不进写作提示词）— 功能2/3/7
+            if config.get("enable_quality_review", False):
+                quality = self.run_quality_review(chapter_id, chapter_text, config)
+                result.quality_report = quality
+                if config.get("quality_auto_fix") and quality.get("auto_fixable"):
+                    try:
+                        fixed = self._auto_fix_quality(
+                            chapter_id, chapter_title, chapter_text, quality, config
+                        )
+                        if fixed:
+                            chapter_text = fixed
+                            chapter_text, _ = self._clean_english_words(chapter_text)
+                            logger.info(f"第{chapter_id}章质量自动修订完成")
+                    except Exception as e:
+                        logger.warning(f"质量自动修订失败(保留原稿): {e}")
+
+            result.chapter_text = chapter_text
+            self._save_chapter_text(chapter_id, chapter_title, chapter_text)
+            self._save_checkpoint(chapter_id, {"chapter_text": chapter_text, "stage": "drafted"})
+
+            # 4. 一致性审查（阻断模式）
+            if not skip_review:
+                if on_progress:
+                    on_progress(PipelineStage.REVIEW)
+                review = self._checker.check(
+                    chapter_id=chapter_id,
+                    chapter_text=chapter_text,
+                    enable_llm_check=config.get("enable_llm_review", False),
+                )
+                result.review_report = review
+
+                if not review.passed:
+                    result.blocked_by_review = True
+                    result.stage = PipelineStage.REVIEW
+                    result.success = False
+                    result.error = f"一致性审查未通过: {review.summary}"
+                    self._save_checkpoint(chapter_id, {
+                        "chapter_text": chapter_text,
+                        "stage": "review_blocked",
+                        "review_report": review.to_dict(),
+                    })
+                    logger.info(f"第{chapter_id}章被审查阻断: {review.summary}")
+                    return result
+
+            # 5-9. 提交记忆（包含自动摘要生成）
+            if on_progress:
+                on_progress(PipelineStage.FACT_EXTRACTION)
+            commit_report = self._memory.commit_chapter(
+                chapter_id=chapter_id,
+                chapter_title=chapter_title,
+                chapter_text=chapter_text,
+                config=config,
+                on_progress=lambda msg: on_progress(PipelineStage.COMMIT) if (on_progress and "提交" in msg) else None,
+            )
+            result.commit_report = commit_report
+
+            # 检查记忆提交是否成功
+            if not commit_report.success:
+                logger.warning(f"第{chapter_id}章记忆提交存在问题: {commit_report.error}")
+                # 不阻断流程，但在结果中标记
+                result.error = f"记忆提交部分失败: {commit_report.error}"
+
+            # 清除 checkpoint
+            self._clear_checkpoint(chapter_id)
+
+            if on_progress:
+                on_progress(PipelineStage.DONE)
+
+            result.success = True
+            logger.info(f"第{chapter_id}章写作流水线完成: {len(chapter_text)}字, {result.tokens_used} tokens")
+
+        except Exception as e:
+            result.success = False
+            result.error = str(e)
+            logger.error(f"写作流水线失败: {e}")
+
+        return result
+
+    def continue_writing(
+        self,
+        chapter_id: int,
+        chapter_title: str,
+        existing_text: str,
+        continue_instruction: str,
+        config: dict,
+        on_progress: Optional[Callable[[PipelineStage], None]] = None,
+        on_stream: Optional[Callable[[str], None]] = None,
+        skip_review: bool = False,
+        problem_mode: bool = False,
+    ) -> PipelineResult:
+        """续写已有章节。用户提供续写方向/灵感。"""
+        result = PipelineResult()
+
+        try:
+            if on_progress:
+                on_progress(PipelineStage.CONTEXT_ASSEMBLY)
+
+            memory_result = self._memory.retrieve_for_writing(chapter_id, continue_instruction, config)
+            next_outline_str = self._get_next_chapter_outline_str(chapter_id)
+            tags = self._memory.get_project_tags()
+            process_tags = self._memory.get_project_process_tags()
+
+            # 节奏标签（续写同样须忠于本章节奏定位）
+            cur_outline = self.get_chapter_outline(chapter_id) or {}
+            current_rhythm = (
+                cur_outline.get("rhythm")
+                or self._infer_rhythm_from_type(cur_outline.get("chapter_type"))
+                or ""
+            ).strip()
+
+            context = self._assembler.assemble(
+                chapter_id=chapter_id,
+                writing_instruction=f"续写方向：{continue_instruction}\n\n已有正文结尾：\n{existing_text[-2000:]}",
+                memory_result=memory_result,
+                previous_chapter_text=existing_text[-3000:] if len(existing_text) > 3000 else existing_text,
+                genre=config.get("genre", ""),
+                next_chapter_outline=next_outline_str,
+                problem_mode=problem_mode,
+                current_rhythm=current_rhythm,
+                tags=tags,
+                process_tags=process_tags,
+            )
+            result.tokens_used = context.total_tokens
+
+            if on_progress:
+                on_progress(PipelineStage.DRAFTING)
+
+            context.messages.append({
+                "role": "user",
+                "content": f"请继续上面的内容续写。续写方向：{continue_instruction}\n\n直接输出续写内容，不要重复已有内容。"
+            })
+
+            new_text = self._draft(context, on_stream)
+            result.chapter_text = existing_text + "\n" + new_text
+            self._save_chapter_text(chapter_id, chapter_title, result.chapter_text)
+
+            # 审查
+            if not skip_review:
+                if on_progress:
+                    on_progress(PipelineStage.REVIEW)
+                review = self._checker.check(
+                    chapter_id=chapter_id,
+                    chapter_text=result.chapter_text,
+                    enable_llm_check=config.get("enable_llm_review", False),
+                )
+                result.review_report = review
+                if not review.passed:
+                    result.blocked_by_review = True
+                    result.success = False
+                    result.error = f"一致性审查未通过: {review.summary}"
+                    return result
+
+            if on_progress:
+                on_progress(PipelineStage.FACT_EXTRACTION)
+            result.commit_report = self._memory.commit_chapter(
+                chapter_id=chapter_id,
+                chapter_title=chapter_title,
+                chapter_text=result.chapter_text,
+                config=config,
+            )
+
+            if on_progress:
+                on_progress(PipelineStage.DONE)
+            result.success = True
+
+        except Exception as e:
+            result.success = False
+            result.error = str(e)
+            logger.error(f"续写失败: {e}")
+
+        return result
+
+    def rewrite_chapter(
+        self,
+        chapter_id: int,
+        chapter_title: str,
+        writing_instruction: str,
+        config: dict,
+        on_progress: Optional[Callable[[PipelineStage], None]] = None,
+        on_stream: Optional[Callable[[str], None]] = None,
+        skip_review: bool = False,
+        existing_text: str = "",
+        problem_mode: bool = True,
+    ) -> PipelineResult:
+        """重写章节（基于现有正文重新生成），先清除旧记忆数据。
+
+        若提供 existing_text（本章已有正文），则将其作为重写基准注入写作指令，
+        保证重写后的正文与已有内容在人物/设定/情节上保持连贯（修复「写作没有根据正文来」）。
+
+        problem_mode 默认 True：重写属「小说出问题/需优化」场景，系统提示只保留
+        硬约束（纯中文+输出规范），不装 L1 核心技法 / L2 可选模块，最大限度省 token。
+        """
+        self._memory.rag.delete_chapter(chapter_id)
+        self._clear_checkpoint(chapter_id)
+        logger.info(f"已清除第{chapter_id}章旧向量数据")
+
+        if existing_text and existing_text.strip():
+            effective_instruction = (
+                f"【重写要求】{writing_instruction}\n\n"
+                f"【本章现有正文（请在保持人物、设定、情节连贯的前提下重写/优化，"
+                f"不要偏离已有内容，可增删润色）】\n"
+                f"{existing_text[-4000:]}"
+            )
+        else:
+            effective_instruction = writing_instruction
+
+        return self.write_chapter(
+            chapter_id=chapter_id,
+            chapter_title=chapter_title,
+            writing_instruction=effective_instruction,
+            config=config,
+            on_progress=on_progress,
+            on_stream=on_stream,
+            skip_review=skip_review,
+            problem_mode=problem_mode,
+        )
+
+    def commit_after_review(
+        self,
+        chapter_id: int,
+        chapter_title: str,
+        chapter_text: str,
+        config: dict,
+        on_progress: Optional[Callable[[PipelineStage], None]] = None,
+    ) -> PipelineResult:
+        """
+        审查被阻断后，用户选择"忽略并继续提交"时调用。
+        跳过审查，直接提交记忆。
+        """
+        result = PipelineResult()
+        try:
+            if on_progress:
+                on_progress(PipelineStage.FACT_EXTRACTION)
+            commit_report = self._memory.commit_chapter(
+                chapter_id=chapter_id,
+                chapter_title=chapter_title,
+                chapter_text=chapter_text,
+                config=config,
+            )
+            result.commit_report = commit_report
+            result.chapter_text = chapter_text
+            result.success = True
+            self._clear_checkpoint(chapter_id)
+            if on_progress:
+                on_progress(PipelineStage.DONE)
+        except Exception as e:
+            result.success = False
+            result.error = str(e)
+        return result
+
+    # ============================================================
+    # 项目文件读写辅助
+    # ============================================================
+
+    def _save_setting(self, setting_type: str, content: str):
+        """保存设定文件。"""
+        settings_dir = Path(self._project_root) / "settings"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        path = settings_dir / f"{setting_type}.md"
+        path.write_text(content, encoding="utf-8")
+        logger.info(f"设定已保存: {path}")
+
+    def _save_outline(self, outline_type: str, content: str):
+        """保存大纲文件。"""
+        outline_dir = Path(self._project_root) / "outline"
+        outline_dir.mkdir(parents=True, exist_ok=True)
+        path = outline_dir / f"{outline_type}.md"
+        path.write_text(content, encoding="utf-8")
+        logger.info(f"大纲已保存: {path}")
+
+    def _read_outline(self) -> str:
+        """读取总纲。"""
+        path = Path(self._project_root) / "outline" / "master.md"
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8")
+
+    def _read_setting(self, setting_type: str) -> str:
+        """读取设定。"""
+        path = Path(self._project_root) / "settings" / f"{setting_type}.md"
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8")
+
+    # ============================================================
+    # 断点续传
+    # ============================================================
+
+    def _checkpoint_path(self, chapter_id: int) -> Path:
+        return Path(self._project_root) / ".novelforge" / f"checkpoint_{chapter_id:04d}.json"
+
+    def _load_checkpoint(self, chapter_id: int) -> dict:
+        path = self._checkpoint_path(chapter_id)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_checkpoint(self, chapter_id: int, data: dict):
+        path = self._checkpoint_path(chapter_id)
+        data["updated_at"] = datetime.now().isoformat()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _clear_checkpoint(self, chapter_id: int):
+        path = self._checkpoint_path(chapter_id)
+        if path.exists():
+            path.unlink()
+
+    def has_checkpoint(self, chapter_id: int) -> bool:
+        return self._checkpoint_path(chapter_id).exists()
+
+    # ============================================================
+    # 内部方法
+    # ============================================================
+
+    def _precheck(self, chapter_id: int):
+        project_path = Path(self._project_root)
+        if not (project_path / ".novelforge").exists():
+            raise RuntimeError("项目未初始化，缺少 .novelforge 目录")
+
+    def _get_previous_chapter_ending(self, current_chapter: int) -> str:
+        if current_chapter <= 1:
+            return ""
+        prev_path = Path(self._project_root) / "chapters" / f"chapter_{current_chapter - 1:04d}.md"
+        if not prev_path.exists():
+            return ""
+        try:
+            text = prev_path.read_text(encoding="utf-8")
+            return text[-3000:] if len(text) > 3000 else text
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_truncated(text: str) -> bool:
+        """检测正文是否被 max_tokens 截断（半句收尾、无句末标点）。"""
+        if not text or not text.strip():
+            return False
+        last = text.rstrip()[-1]
+        return last not in "。！？”」）…?!."
+
+    def _draft(self, context, on_stream: Optional[Callable[[str], None]] = None, max_continuations: int = 2) -> str:
+        def _gen(msgs):
+            if on_stream:
+                buf = ""
+                for chunk in self._llm.chat_stream(
+                    messages=msgs,
+                    temperature=self._llm.config.temperature,
+                    max_tokens=self._llm.config.max_tokens,
+                ):
+                    buf += chunk
+                    on_stream(chunk)
+                return buf
+            return self._llm.chat(
+                messages=msgs,
+                temperature=self._llm.config.temperature,
+                max_tokens=self._llm.config.max_tokens,
+            )
+
+        full_text = _gen(context.messages)
+        # 截断续写保护：若正文半句收尾（撞上 max_tokens），自动续写直到正常收束
+        # 杜绝 ch2/4/8/27 这类「断章」，最多续写 max_continuations 次
+        cont = 0
+        while self._is_truncated(full_text) and cont < max_continuations:
+            cont += 1
+            system_msg = next((m for m in context.messages if m.get("role") == "system"), None)
+            base = [system_msg] if system_msg else []
+            cont_instr = (
+                f"上文已写到：\n…{full_text[-200:]}\n\n"
+                f"【请紧接上文继续写，完成本章剩余剧情，并以一个有悬念的结尾钩子收束。"
+                f"不要重复已有内容，不要另起标题，直接接着写。】"
+            )
+            more = self._llm.chat(
+                messages=base + [{"role": "user", "content": full_text + "\n\n" + cont_instr}],
+                temperature=self._llm.config.temperature,
+                max_tokens=1024,
+            )
+            if on_stream:
+                on_stream(more)
+            full_text += more
+            logger.info(f"正文截断续写第{cont}次（累计{len(full_text)}字）")
+        return full_text
+
+    def _save_chapter_text(self, chapter_id: int, title: str, text: str):
+        chapters_dir = Path(self._project_root) / "chapters"
+        chapters_dir.mkdir(parents=True, exist_ok=True)
+        path = chapters_dir / f"chapter_{chapter_id:04d}.md"
+        # 剥离模型多写的顶部标题行，避免与文件规范标题重复/不一致
+        body = self._strip_leading_titles(text)
+        content = f"# 第{chapter_id}章 {title}\n\n{body}"
+        path.write_text(content, encoding="utf-8")
+        logger.info(f"第{chapter_id}章正文已保存: {path}")
