@@ -1,3 +1,21 @@
+# AIChatStudio 跨平台依赖（Mac + Win）
+# 不再依赖 ChromaDB（C++ 在 Win 不稳、PyInstaller 体积大）
 PyQt6>=6.5.0
-chromadb>=0.4.0
-openai>=1.0.0
+openai>=1.30.0
+cryptography>=41.0.0      # core/config_vault AES Fernet
+jinja2>=3.1.0             # core/prompt_repo 模板渲染
+sqlite-vec>=0.1           # core/vector_spi 默认向量实现（不可用时自动降级 numpy/BM25）
+numpy>=1.24               # 向量降级兜底
+
+# 数据分析域
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-docx>=1.1.0
+
+# 数仓域
+sqlglot>=23.0             # SQL 血缘解析（Hive/Spark/Flink/DataX）
+
+# 可选：本地模型
+# ollama>=0.1.7
+# tiktoken>=0.5
+# jieba>=0.42

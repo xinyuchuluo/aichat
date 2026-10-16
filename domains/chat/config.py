@@ -55,7 +55,12 @@ class Config:
             path = Path(self.data_dir) / "config.json"
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), encoding="utf-8")
+        # 合并 dataclass 字段 + 额外 dict 风格属性（last_nf_project 等）
+        payload = asdict(self)
+        for k, v in self.__dict__.items():
+            if k not in self.__dataclass_fields__ and not k.startswith("_"):
+                payload[k] = v
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
@@ -65,7 +70,34 @@ class Config:
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+                # 已知字段走 dataclass 构造
+                known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+                obj = cls(**known)
+                # 额外字段（last_nf_project 等）直接 setattr
+                for k, v in data.items():
+                    if k not in cls.__dataclass_fields__:
+                        setattr(obj, k, v)
+                return obj
             except Exception:
                 pass
         return cls()
+
+    # ---- dict 兼容（widgets/main_window.py 用了 config.get / config["xxx"]）----
+    def get(self, key: str, default=None):
+        """dict 风格访问：已知字段返回值，未知字段返回 __dict__ 里的或 default"""
+        if key in self.__dataclass_fields__:
+            return getattr(self, key)
+        return self.__dict__.get(key, default)
+
+    def __getitem__(self, key: str):
+        if key in self.__dataclass_fields__:
+            return getattr(self, key)
+        if key in self.__dict__:
+            return self.__dict__[key]
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value):
+        setattr(self, key, value)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.__dataclass_fields__ or key in self.__dict__

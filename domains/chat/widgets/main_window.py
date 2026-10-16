@@ -137,9 +137,9 @@ LLM_PROVIDERS: list[dict] = [
 ]
 
 from ..protocol.types import Message, ChatRole, Session
-from ..chat.agent import ChatAgent
-from ..chat.worker import ChatWorker
-from ..chat.session import SessionManager
+from ..session.agent import ChatAgent
+from ..session.worker import ChatWorker
+from ..session.session import SessionManager
 from ..memory.engine import MemoryEngine
 from ..adapters import get_adapter, list_adapters
 from .chat_view import ChatView
@@ -1174,7 +1174,7 @@ class MainWindow(QMainWindow):
         # 最简单：如果有当前会话，重建它的 agent
         if self._sessions.current:
             try:
-                from aichat.adapters import get_adapter
+                from ..adapters import get_adapter
                 s = self._sessions.current
                 adapter = get_adapter(s.adapter_key, **s.adapter_config)
                 self._setup_agent(s, adapter)
@@ -1358,7 +1358,7 @@ class _SendWorker(QThread):
             else:
                 # 图片链路：手动组装 messages（最后一条 user = 含 images 的 to_llm_dict parts）
                 # 先 commit 一次用户消息（含 images metadata）到 memory
-                from aichat.protocol.types import ChatRole, Message
+                from ..protocol.types import ChatRole, Message
                 scope = self._agent._adapter.get_scope(self._session)
                 self._agent._memory.commit_message(
                     self._user_message_ref, self._session.id, scope=scope,
@@ -1406,7 +1406,7 @@ class _SendWorker(QThread):
 
                 # 工具解析 & 提交 assistant 消息
                 try:
-                    from aichat.tools import extract_and_run
+                    from ..tools import extract_and_run
                     processed, tool_results = extract_and_run(full)
                 except Exception:
                     processed, tool_results = full, []

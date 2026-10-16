@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
-"""AIChat — 通用 AI 聊天软件入口。"""
-import sys
+"""AIChatStudio — 入口。
+
+当前阶段：先让原 AIChat（domains/chat/）跑起来，验证迁移路径正确。
+后续接入 shell/main_window 一体化壳 + 其他 4 个域。
+"""
 import os
+import sys
 import traceback
 
-# 确保 aichat 包可导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
-def main():
+def main() -> int:
     try:
-        from PyQt6.QtWidgets import QApplication, QMessageBox
-        from PyQt6.QtCore import Qt
+        from PyQt6.QtWidgets import QApplication
     except ImportError:
-        print("错误：未安装 PyQt6，请运行 pip install PyQt6")
-        sys.exit(1)
+        print("错误：未安装 PyQt6，请运行 pip install -r requirements.txt")
+        return 1
 
     try:
-        from aichat.config import Config
-        from aichat.memory.engine import MemoryEngine
-        from aichat.chat.session import SessionManager
-        from aichat.ui.main_window import MainWindow
-        from aichat.ui.styles import apply_skin
-        # 适配器按需通过 register_adapters 注册，无需单独导入
+        from domains.chat.config import Config
+        from domains.chat.memory.engine import MemoryEngine
+        from domains.chat.session.session import SessionManager
+        from domains.chat.widgets.main_window import MainWindow
+        from domains.chat.widgets.styles import apply_skin
     except ImportError as e:
         print(f"导入错误：{e}")
         traceback.print_exc()
-        sys.exit(1)
+        return 1
 
     app = QApplication(sys.argv)
-    app.setApplicationName("AIChat")
+    app.setApplicationName("AIChatStudio")
 
-    # 加载配置
+    # 加载配置（沿用原 AIChat 的 Config，不动）
     config = Config.load()
     config.save()
 
@@ -40,7 +41,7 @@ def main():
     memory.set_summarize_threshold(config.summarize_threshold)
     sessions = SessionManager(config.data_dir)
 
-    # 应用皮肤
+    # 应用皮肤（暂用原 AIChat 皮肤，后续切到 shell/styles.py 浅色主题）
     apply_skin(app, config.skin)
 
     # 主窗口
@@ -48,11 +49,11 @@ def main():
     window.show()
 
     # 注册适配器
-    from aichat.adapters import register_adapters
+    from domains.chat.adapters import register_adapters
     register_adapters(window, config)
 
-    sys.exit(app.exec())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

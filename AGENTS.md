@@ -1,4 +1,4 @@
-# AGENTS.md — AIChat 通用 AI 聊天软件（coding agent 上手指南）
+# AGENTS.md — AIChatStudio 一体化 App（coding agent 上手指南）
 
 > **本文件是项目的权威上手源，专供 coding agent（Claude Code / Cursor / Codex / WorkBuddy / 任意 AI 编码工具）阅读。**
 > 任何 AI 工具进入本目录后，读这一份即可无缝开工。
@@ -6,6 +6,10 @@
 > **🔴 维护铁律（硬约束）**：本文件记录项目结构、架构约定、工作流与已踩过的坑。
 > **每次代码结构 / 约定 / 工作流变更，必须同步更新本文件。**
 > 新增功能、改路径、改约定、修了某个坑，都要回写这一份——否则下个 agent 会踩你踩过的坑。
+>
+> **🔴🔴 同步铁律（AI 协作硬约束）**：AI 改完代码 **不许自动 git push**。
+> 每次改完必须告诉用户：改了哪些文件 / 当前 git 状态 / 是否同步？
+> **只有用户明确说"同步"/"push"才执行 `git push origin main`**。
 
 ---
 
@@ -24,54 +28,79 @@
 5. **回写本文档（维护纪律）**：任何结构/约定/工作流变更 → 同步更新本文档；新增的坑/验证方法补进对应小节（§7）。
 
 ## 0. 一句话定位
-PyQt6 桌面端通用 AI 聊天软件：赛博朋克风 UI、四层记忆架构、可插拔适配器（通用闲聊 / NovelForge 小说 / 数据分析）、Agent Skill 功能池 + FlowBlueprint/FlowRun 任务卡流程。作家陈志超维护，与 NovelForge、data-analyst-tool 是三套独立软件。
+一体化桌面 App（PyQt6 + 浅色主题），整合 5 个创作/工作域（chat 聊天记忆 / novel 小说 / studio 短片 / warehouse 数仓建设 / analysis 数据分析），共享平台内核 core/（工作区契约 / LLM 客户端 SPI / 加密配置 / 提案闸门 / 守卫注册 / DAG 原语 / 向量 SPI / 提示词仓库）。作家陈志超维护，Mac + Win 双系统。原 5 个独立软件（AIChat / NovelForge / data-analyst-tool / 短片 PRD / 数仓 PRD）合并到此仓库，原仓库继续保留作备份。
+
+## 0.1 分支地图（硬约束）
+| 分支 | 含 | 用途 |
+|---|---|---|
+| `main` | core + shell + 5 域 + prompts + pack + docs | 个人机全量部署 |
+| `chat-warehouse` | core + shell + chat + warehouse | 公司机/工作机最小部署（无创作域） |
+
+- 全量拉取：`git clone git@github.com:xinyuchuluo/AIChat.git`
+- 工作机最小集：`git clone -b chat-warehouse git@github.com:xinyuchuluo/AIChat.git`
+- 同步分支（main 有更新后）：`./pack/sync-branch.sh`（合并 main → 删 novel/studio/analysis → push）
 
 ## 1. 目录与数据位置（铁律）
-- **软件目录**：`/Users/chenzhichao/AIChat/`（独立，**禁止**与 WorkBuddy / NovelForge 混目录）。
-- **数据目录**：`~/AIChat_Data/`（即 `/Users/chenzhichao/AIChat_Data/`，显式目录，Finder 可见）。配置 `config.json` 也在这里。
-- **历史坑**：旧数据目录曾用隐藏的 `~/.aichat/`，Finder 不可见、TCC 沙箱难写。`Config.__post_init__` 会一次性自动迁移 `~/.aichat` → `~/AIChat_Data`（写 `_migrated_from_dot_aichat` 标记，只跑一次）。**禁止再把 data_dir 改回隐藏目录**。
-- 数据目录内容：`config.json`、`raw_memories.db`（L2）、`tree_memories.db`（L3）、`vector_index/`（L4 ChromaDB）、`sessions.json`、`reports/`（数据分析 HTML 报告）、`_migrated_from_dot_aichat`。
+- **软件目录**：`/Users/chenzhichao/AIChat/`（仓库根）。
+- **工作区根**：`~/AichatStudio/`（Mac）/ `%USERPROFILE%\AichatStudio\`（Win）。
+  - 首次启动自动创建 `~/AichatStudio/default/` 默认工作区
+  - 多工作区：每个 workspace.json 声明启用哪些域
+  - 公司机用 chat-warehouse 分支，workspace.json 的 enabled_domains 只列 `["chat", "warehouse"]`
+- **历史坑**：旧数据目录 `~/AIChat_Data/` 已废弃，迁移到工作区目录下；旧 `~/.aichat/` 也废弃。**禁止再回到旧目录**。
+- 工作区目录内容：`workspace.json`、`config.enc`（AES 加密 API Key）、`secret.key`、`chat/`、`novel/`、`studio/`、`warehouse/`、`analysis/`。
+- **不入库**：`~/AichatStudio/` 整个不入库（用户数据私有）；`config.enc` 和 `secret.key` 即使复制到仓库也不入库（`.gitignore` 排除）。
 
 ## 2. 目录与模块结构（精确路径）
 ```
-AIChat/
-├─ main.py                 ← 【入口】python3 main.py（cwd 必须=本目录）
-├─ AIChat.command           ← macOS 双击启动脚本
-├─ AIChat.spec              ← PyInstaller 打包规格
-├─ build_app.command        ← 打包成 AIChat.app
-├─ requirements.txt
-├─ aichat/
-│  ├─ config.py            ← Config dataclass（LLM/记忆/UI/适配器 全局配置）
-│  ├─ tools.py             ← 【核心】Skill 功能池 + 工具/记忆协议 + 分发
-│  ├─ flow.py              ← 【核心】FlowBlueprint/FlowRun + 记忆管理器
-│  ├─ protocol/
-│  │  ├─ types.py          ← Message/Session/ChatRole/MemoryQuery/MemoryResult 数据类
-│  │  ├─ adapter.py        ← ChatAdapter 抽象基类
-│  │  └─ events.py         ← 事件类型
-│  ├─ memory/
-│  │  ├─ engine.py         ← 【核心】MemoryEngine 四层协调器
-│  │  ├─ working.py        ← L1 工作记忆（内存，token 裁剪）
-│  │  ├─ sqlite_store.py   ← L2 SQLite 原始真相库（raw_text 只追加）
-│  │  ├─ tree_store.py     ← L3 树形记忆（父子节点）
-│  │  └─ vector_store.py  ← L4 ChromaDB 向量索引
-│  ├─ chat/
-│  │  ├─ agent.py          ← 【核心】ChatAgent 消息组装+LLM调用+工具/记忆/Flow 提取
-│  │  ├─ session.py        ← SessionManager 会话管理
-│  │  └─ worker.py        ← _SendWorker 后台线程（防 UI 冻结，ChromaDB 下载慢）
-│  ├─ adapters/
-│  │  ├─ __init__.py       ← 适配器注册表 register_adapters()
-│  │  ├─ generic.py        ← GenericAdapter 通用闲聊（注入 TOOL_PROTOCOL_MD + MEMORY_PROTOCOL_MD）
-│  │  ├─ novelforge.py     ← NovelForgeAdapter 集成小说项目记忆/讨论
-│  │  └─ data_analysis.py  ← DataAnalysisAdapter 集成数据分析工作流程
-│  └─ ui/
-│     ├─ main_window.py    ← PyQt6 主窗（菜单/会话栏/聊天区/记忆面板/状态栏）
-│     ├─ chat_view.py      ← 聊天视图（赛博朋克气泡/FlowCardWidget 任务卡/流式心跳）
-│     ├─ md_render.py      ← 自定义 Markdown→Qt 富文本渲染（代码块复制）
-│     ├─ styles.py         ← 皮肤系统（cyberpunk + 动态主题 YIQ 配色）
-│     ├─ memory_panel.py   ← 记忆查看面板
-│     └─ session_sidebar.py ← 会话侧边栏
+AIChat/                          ← 仓库根（即新的一体化 App 根目录）
+├─ main.py                       ← 【入口】python3 main.py
+├─ requirements.txt              ← 跨平台依赖（不含 chromadb，含 sqlite-vec）
+├─ AGENTS.md                     ← 本文件
+├─ README.md                     ← 分支地图 + 同步纪律
+├─ .gitignore                    ← 排除工作区数据 + config.enc + secret.key
+├─ core/                         ← 【平台内核】写一次，五域共用
+│  ├─ __init__.py
+│  ├─ workspace.py               ← 工作区契约 + 多工作区 + 声明启用域
+│  ├─ llm_client.py              ← LLM SPI + 步骤级 profile 路由 + 客户端缓存
+│  ├─ config_vault.py            ← AES Fernet 加密配置存储
+│  ├─ proposal_gate.py           ← 提案→闸门→权威（三档严格度）
+│  ├─ guard_registry.py          ← 零 token 守卫注册框架
+│  ├─ graph_primitives.py        ← 关系/事件/DAG 原语
+│  ├─ vector_spi.py              ← 向量检索 SPI（sqlite-vec/numpy/BM25 三级降级）
+│  └─ prompt_repo.py             ← 提示词仓库（Jinja2 + 版本号 + 可回滚）
+├─ shell/                        ← 【一体化壳】
+│  ├─ __init__.py
+│  ├─ main_window.py             ← 主窗口 + 域面板挂载点
+│  ├─ session_hub.py             ← 会话 + 任务卡中心（底部 dock）
+│  ├─ window_manager.py          ← 多窗口/模块拉起
+│  ├─ workspace_switcher.py       ← 工作区切换器（顶部）
+│  └─ styles.py                  ← 浅色主题 QSS（全局唯一，各域不许改）
+├─ domains/                      ← 五个域
+│  ├─ chat/                      ← 聊天记忆域（来自原 aichat/ 子目录）
+│  │  ├─ memory/                 ← 四层记忆（L1 working/L2 sqlite/L3 tree/L4 vector）
+│  │  ├─ protocol/               ← ChatAdapter + types + events
+│  │  ├─ session/                ← ChatAgent + SessionManager + Worker
+│  │  ├─ adapters/               ← GenericAdapter（其他域通过 Facet 接管，不再走 adapter）
+│  │  └─ widgets/                ← chat_view / session_sidebar / memory_panel / x_browser_panel
+│  ├─ novel/                     ← 小说域（来自 NovelForge，先清场 attic/ 分支再 copy）
+│  ├─ studio/                    ← 短片域（PRD 新写，PyQt，无 LLM，5 表 + 5 模板）
+│  ├─ warehouse/                 ← 数仓建设域（PRD 新写，4 模块 + 4 守卫）
+│  └─ analysis/                  ← 数据分析域（来自 data-analyst-tool）
+├─ prompts/                      ← 提示词作为数据（用户可编辑，Jinja2 + 版本号）
+│  ├─ chat/                       ├─ novel/   ├─ studio/   ├─ warehouse/   └─ analysis/
+│  └─ .versions/                 ← 旧版本归档（可回滚）
+├─ pack/                         ← 打包脚本
+│  ├─ sync-branch.sh             ← chat-warehouse 分支同步脚本
+│  ├─ mac.spec                    ← PyInstaller Mac（待写）
+│  └─ win.spec                    ← PyInstaller Win（待写）
+└─ docs/                         ← 原 AIChat 文档（AICHAT_DOC.md / 启动方式速查 / 等）
 ```
-- **import 根 = 项目根目录**：`from aichat.xxx import ...`。运行 `python3 main.py` 时 cwd 必须等于 `/Users/chenzhichao/AIChat`（`main.py` 已 `sys.path.insert` 兜底）。
+- **import 根 = 项目根目录**：`from core.xxx import ...`、`from shell.xxx import ...`、`from domains.chat.xxx import ...`。运行 `python3 main.py` 时 cwd 必须等于 `/Users/chenzhichao/AIChat`（`main.py` 已 `sys.path.insert` 兜底）。
+- **内核纪律（硬约束）**：
+  1. 内核不许 import 任何域（`core/` 下任何文件不得 `from domains.*`）
+  2. 域只许 import 内核（`from core.xxx import`）；域之间不许互相 import
+  3. 提示词/背景/模板全部走 `prompts/` 数据文件，**不许硬编码进 .py**
+  4. 任何 LLM 产出不得直接落库，必须经 `core/proposal_gate` 提案→闸门→权威通道
 - 不强制 venv：依赖装到系统 Python（3.10+）。安装：`pip install -r requirements.txt`。
 
 ## 3. 核心架构约定（改代码前必读）
