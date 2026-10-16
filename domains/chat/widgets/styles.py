@@ -61,7 +61,7 @@ SKINS: dict[str, Skin] = {
                     "#22c55e","#f59e0b","#ef4444","#8b5cf6")),
 }
 
-DEFAULT_SKIN = "cyberpunk"
+DEFAULT_SKIN = "breeze"
 _CURRENT: str = DEFAULT_SKIN
 
 # ===== 运行时皮肤跟踪 + 派生对比色（确保文字/背景对比度） =====

@@ -24,25 +24,25 @@ FONT_FAMILY = (
     'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 )
 
-# 浅色 token
+# 浅色 token（对齐 chat 域 breeze 皮肤，视觉统一）
 LIGHT_TOKENS = {
-    "bg": "#F7F7F8",
+    "bg": "#fbfdff",
     "bg_card": "#FFFFFF",
-    "bg_hover": "#EFEFF2",
-    "bg_pressed": "#E5E5EA",
-    "border": "rgba(23, 23, 23, 0.12)",
-    "border_strong": "rgba(23, 23, 23, 0.20)",
-    "text": "#171717",
-    "text_muted": "#52525B",
-    "text_disabled": "#A1A1AA",
-    "brand": "#0FDC78",
-    "brand_hover": "#0BC768",
-    "brand_pressed": "#09B05A",
-    "brand_text": "#004D26",
-    "brand_soft": "#E5FFF2",
-    "danger": "#E5484D",
-    "warning": "#F5A623",
-    "info": "#0EA5E9",
+    "bg_hover": "#f0f5fa",
+    "bg_pressed": "#e3eaf2",
+    "border": "rgba(15, 23, 42, 0.12)",
+    "border_strong": "rgba(15, 23, 42, 0.20)",
+    "text": "#0f172a",
+    "text_muted": "#475569",
+    "text_disabled": "#94a3b8",
+    "brand": "#10b981",
+    "brand_hover": "#059669",
+    "brand_pressed": "#047857",
+    "brand_text": "#ffffff",
+    "brand_soft": "#ecfdf5",
+    "danger": "#ef4444",
+    "warning": "#f59e0b",
+    "info": "#0ea5e9",
 }
 
 # 暗色 token（备用，未来切换时用）

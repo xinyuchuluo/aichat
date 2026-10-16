@@ -20,7 +20,7 @@ class Config:
     working_memory_max: int = 50
     working_memory_tokens: int = 8000
     # UI
-    skin: str = "cyberpunk"
+    skin: str = "breeze"
     font_size: int = 14
     # 适配器
     default_adapter: str = "generic"
