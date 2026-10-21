@@ -529,7 +529,7 @@ class FlowMemoryManager:
               ├── StepNode2 (leaf)
               └── ...
         """
-        from .memory.tree_store import TreeNode
+        from core.memory import TreeNode
 
         tree = self._mem.tree
         vector = self._mem.vector

@@ -46,8 +46,9 @@
   - 首次启动自动创建 `~/AichatStudio/default/` 默认工作区
   - 多工作区：每个 workspace.json 声明启用哪些域
   - 公司机用 chat-warehouse 分支，workspace.json 的 enabled_domains 只列 `["chat", "warehouse"]`
-- **历史坑**：旧数据目录 `~/AIChat_Data/` 已废弃，迁移到工作区目录下；旧 `~/.aichat/` 也废弃。**禁止再回到旧目录**。
+- **历史坑**：旧数据目录 `~/AIChat_Data/` 已废弃（原样保留作冷备份，不迁移、不再写入）；旧 `~/.aichat/` 也废弃。**禁止再回到旧目录**。
 - 工作区目录内容：`workspace.json`、`config.enc`（AES 加密 API Key）、`secret.key`、`chat/`、`novel/`、`studio/`、`warehouse/`、`analysis/`。
+  - chat 域数据：`<workspace>/chat/memory/`（raw_memories.db / tree_memories.db / vector_index.db）、`<workspace>/chat/sessions/`（会话 JSON）、`<workspace>/chat/config.json`。
 - **不入库**：`~/AichatStudio/` 整个不入库（用户数据私有）；`config.enc` 和 `secret.key` 即使复制到仓库也不入库（`.gitignore` 排除）。
 
 ## 2. 目录与模块结构（精确路径）
@@ -67,6 +68,14 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 │  ├─ guard_registry.py          ← 零 token 守卫注册框架
 │  ├─ graph_primitives.py        ← 关系/事件/DAG 原语
 │  ├─ vector_spi.py              ← 向量检索 SPI（sqlite-vec/numpy/BM25 三级降级）
+│  ├─ memory/                    ← 【记忆内核】四层记忆后端，与域解耦、可被外部软件复用
+│  │  ├─ types.py                ← MemoryRecord/Query/Result/TreeNode + observation_type
+│  │  ├─ raw_store.py            ← L2 SQLite 只追加 + FTS5(trigram) + fact_slots 槽位
+│  │  ├─ tree_store.py           ← L3 树节点 + 摘要 FTS5
+│  │  ├─ vector.py              ← L4 向量索引（vector_spi；无 embedder 自动关闭）
+│  │  ├─ retrieve.py            ← 检索链路（FTS5 双路 + 可选向量 → 槽位覆盖 → 回查 L2）
+│  │  ├─ working.py             ← L1 工作记忆（纯内存，不参与检索排序）
+│  │  └─ engine.py              ← MemoryEngine 编排
 │  └─ prompt_repo.py             ← 提示词仓库（Jinja2 + 版本号 + 可回滚）
 ├─ shell/                        ← 【一体化壳】
 │  ├─ __init__.py
@@ -77,7 +86,7 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 │  └─ styles.py                  ← 浅色主题 QSS（全局唯一，各域不许改）
 ├─ domains/                      ← 五个域
 │  ├─ chat/                      ← 聊天记忆域（来自原 aichat/ 子目录）
-│  │  ├─ memory/                 ← 四层记忆（L1 working/L2 sqlite/L3 tree/L4 vector）
+│  │  ├─ memory/                 ← 已删除：记忆实现在 core/memory/（域不再自带记忆层）
 │  │  ├─ protocol/               ← ChatAdapter + types + events
 │  │  ├─ session/                ← ChatAgent + SessionManager + Worker
 │  │  ├─ adapters/               ← GenericAdapter（其他域通过 Facet 接管，不再走 adapter）
@@ -106,12 +115,17 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 ## 3. 核心架构约定（改代码前必读）
 
 ### 3.1 四层记忆架构（硬约束，不可违背）
-- **L1 工作记忆**：每会话独立，**纯内存，无持久化**。`working.py` 按 token 上限裁剪老消息。
-- **L2 SQLite 原始真相库**：`raw_memories.db`。**`raw_text` 字段只追加，永不修改**。业务事实回查必须回 L2 取原文。
-- **L3 树形记忆**：`tree_memories.db`。**异步批量生成**，由 N 轮对话/话题切换触发（`summarize_threshold` 默认 10），**禁止每轮调 LLM**。
-- **L4 向量索引**：ChromaDB `vector_index/`。**只存树节点摘要 + metadata，用于召回 UUID**，不存业务原文。
-- **检索链路（固定顺序）**：metadata 过滤 → 树形分支筛选 → 向量召回 UUID → Rerank 精排 → 回查 L2 原文。
+> 实现位置：`core/memory/`（内核，不 import 任何域）。chat 域只调用，不自带记忆实现。
+> 目标：像 claude-mem 一样可被其他软件复用；对外只读检索（search / timeline / get），写入仅本 App 或导入器。
+
+- **L1 工作记忆**：`core/memory/working.py`，每会话独立，**纯内存，无持久化**。只服务当轮上下文组装，**不参与检索排序**（近期消息不得压过长期事实）。
+- **L2 SQLite 原始真相库**：`raw_memories.db`。**`content` 只追加，永不修改**。业务事实回查必须回 L2 取原文。
+- **L3 树形记忆**：`tree_memories.db`。**异步批量生成**，由 N 条未归纳记录/话题切换触发（`summarize_threshold` 默认 10），**禁止每轮调 LLM**。当前只生成 `leaf`，mid/root 暂留 schema 不实现（用户决定：上线有问题再改）。
+- **L4 向量索引**：`vector_index.db`，走 `core/vector_spi.py`（sqlite-vec → numpy → BM25）。**只存树节点摘要 + metadata，用于召回 UUID**，不存业务原文。**已移除 ChromaDB**；无 embedder 时本层自动关闭，检索退化为 FTS5 关键词。
+- **检索链路（固定顺序，`core/memory/retrieve.py`）**：metadata 过滤 → L2 原文 FTS5 → L3 摘要 FTS5 展开 UUID → L4 向量展开 UUID（可选）→ 槽位覆盖 → 回查 L2 原文 → 按分数取 top_k。
+- **观察类型**：`observation_type` 区分 `fact/preference/entity/reminder`（状态型，写 `fact_slots` 槽位表，检索只认当前值，旧记录仍留 L2）与 `decision/bugfix/event/flow_step/chat`（时间线型，只追加）。
 - **过期机制**：用 `is_expired` 布尔标记，**不物理删除**。L2/L3/L4 三层都要同步标记。
+- **中文检索**：FTS5 `tokenize='trigram'`；老版本 SQLite 自动降级 `unicode61` 或 LIKE。
 
 ### 3.2 聊天流水线（`chat/agent.py` ChatAgent.chat）
 固定顺序，**不要乱序**：
@@ -152,7 +166,7 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 ## 4. LLM 调用约定
 - OpenAI 兼容接口，参数从 `Config` 提取（model/temperature/max_tokens/api_key/base_url）。
 - 模型设置窗口含 8 个官方服务商预设，自动填 Base URL + 模型列表 + 控制台超链接；能力勾选框（联网/多模态/文件/工具/代码执行）按服务商+模型自动勾。
-- 记忆检索 + LLM 调用**必须**在后台线程 `_SendWorker` 跑，防 UI 冻结（ChromaDB 首次下载模型慢，已踩坑）。
+- 记忆检索 + LLM 调用**必须**在后台线程 `_SendWorker` 跑，防 UI 冻结。
 
 ## 5. 内置 Skill 清单（`tools.py`）
 | 类别 | Skill | 说明 |
@@ -179,7 +193,8 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 ## 6. 验证方法
 - 语法：`find /Users/chenzhichao/AIChat -name "*.py" | xargs python3 -m py_compile`
 - 启动：`cd /Users/chenzhichao/AIChat && python3 main.py`
-- 记忆链路：发一条消息 → 检查 `~/AIChat_Data/raw_memories.db` 有新记录 → 凑够 `summarize_threshold` 条 → 检查 `tree_memories.db` 生成节点。
+- 记忆链路：发一条消息 → 检查 `~/AichatStudio/<workspace>/chat/memory/raw_memories.db` 有新记录 → 凑够 `summarize_threshold` 条 → 检查同目录 `tree_memories.db` 生成节点。
+- 中文检索冒烟：`MemoryEngine(dir).search("中文关键词", scope="chat")` 应返回命中；状态型记忆同 `key` 只返回最新值。
 - 工具：让 AI 调 `get_system_info`，确认返回 JSON 且气泡显示 `<|tool_result|>`。
 - 记忆提取：让 AI 回复带 `<|memory| type="fact">{"content":"测试"}</|memory|>`，确认用户侧看不到该标签、且记忆库有 `[记忆·fact]` 记录。
 
@@ -191,6 +206,16 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 - `SQLiteStore.mark_expired` 曾缺 `conn.commit()` → 过期标记不生效，已补。
 - 流式消息缺 model badge/能力标签 → `finish_streaming()` 强制注入 metadata。
 - macOS TCC 沙箱：从 IDE/Terminal 启动写入外部目录报 `[Errno 1] Operation not permitted` → 引导用户从 Finder 双击 `AIChat.command` 启动；写文件用原子写（`.tmp_{pid}` → fsync → `os.replace`）。
+
+## 9. 密钥统一管理（凭证中心）
+
+🔴 硬约束：API Key 全系统只存一份 —— AIChat 工作区 vault `<workspace>/config.enc`（AES Fernet）。
+
+- 模块：`core/credential_hub.py`（`get/set_api_profiles`、`get/set_step_routing`、`ensure_migrated`）。
+- 禁止：任何域/独立软件自建明文 key 或独立 enc。novel 旧明文 `domains/.novelforge/config.json` 已改为本地只留非敏感调参且 api_key 留空；analysis `~/.data_analyst` 本地 enc 不再含 api_profiles。
+- 迁移：`ensure_migrated()` 幂等，首启自动跑；旧 key 并入 vault 后原文件备份 `.bak`。
+- studio / warehouse 不调 LLM，不消费 key，但同属体系。
+- 本次改动文件：`core/credential_hub.py`(新)、`domains/novel/config.py`(load 取 vault / save 写 vault+本地留空)、`domains/analysis/core/config_manager.py`(load 合并 / save 拆分)、`main.py`(启动触发迁移)、`.gitignore`(忽略 `.novelforge/`)。
 
 ## 8. 待办跟进
 跨会话待办写进本文件 §8 或 memory。新增任务直接在此加 `- [ ] xxx`。

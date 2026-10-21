@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Generator, Any
 from ..protocol.types import Message, ChatRole, Session, MemoryResult
 from ..protocol.adapter import ChatAdapter
-from ..memory.engine import MemoryEngine
+from core.memory import MemoryEngine
 
 
 class ChatAgent:

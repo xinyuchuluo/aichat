@@ -18,28 +18,43 @@ __version__ = "0.1.0"
 
 # 单例缓存：避免每次开 Tab 都重建 memory/sessions/MainWindow
 _main_window: Optional["object"] = None
+_main_window_root: str = ""
 
 
 def _build_main_window():
     """构造 chat 域主面板（原 AIChat MainWindow）
 
     首次调用时初始化 Config / MemoryEngine / SessionManager，缓存 MainWindow 实例。
-    后续调用直接返回缓存（避免数据重复加载）。
+    同一工作区内复用缓存；切换工作区后数据源变了，自动重建。
+
+    记忆内核来自 core.memory（与具体域解耦），数据落 <workspace>/chat/memory/。
     """
-    global _main_window
-    if _main_window is not None:
+    global _main_window, _main_window_root
+
+    from core import workspace as ws_mod
+
+    # 必须用 current()：ensure_default() 会把当前工作区重置为 default
+    ws = ws_mod.current() or ws_mod.ensure_default()
+    root = str(ws.root)
+    if _main_window is not None and _main_window_root == root:
         return _main_window
 
+    # 工作区变了：丢弃旧面板，避免继续读写上一个工作区的数据
+    _main_window = None
+
+    from pathlib import Path
+
+    from core.memory import MemoryEngine
     from domains.chat.config import Config
-    from domains.chat.memory.engine import MemoryEngine
     from domains.chat.session.session import SessionManager
     from domains.chat.widgets.main_window import MainWindow
 
     config = Config.load()
     config.save()
-    memory = MemoryEngine(config.data_dir)
+    chat_dir = Path(config.data_dir)
+    memory = MemoryEngine(chat_dir / "memory")
     memory.set_summarize_threshold(config.summarize_threshold)
-    sessions = SessionManager(config.data_dir)
+    sessions = SessionManager(chat_dir / "sessions")
 
     window = MainWindow(config, memory, sessions)
 
@@ -51,6 +66,7 @@ def _build_main_window():
         logger.warning("register_adapters failed: %s", e)
 
     _main_window = window
+    _main_window_root = root
     return window
 
 

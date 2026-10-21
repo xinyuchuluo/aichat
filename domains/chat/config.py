@@ -1,8 +1,31 @@
-"""AIChat 配置。"""
+"""AIChat 配置。
+
+配置文件落当前工作区 <workspace>/chat/config.json（不再是旧 ~/AIChat_Data）。
+"""
+
 from __future__ import annotations
+
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
+
+LEGACY_CONFIG = "~/AIChat_Data/config.json"
+
+
+def _workspace_chat_dir() -> Path:
+    """当前工作区的 chat 数据目录；内核不可用时用默认工作区路径兜底。"""
+    try:
+        from core import workspace as ws_mod
+
+        # 必须用 current()：ensure_default() 会把当前工作区重置为 default
+        ws = ws_mod.current() or ws_mod.ensure_default()
+        return ws.data_path("chat")
+    except Exception:  # noqa: BLE001
+        return Path.home() / "AichatStudio" / "default" / "chat"
+
+
+def _default_config_path() -> Path:
+    return _workspace_chat_dir() / "config.json"
 
 
 @dataclass
@@ -15,7 +38,7 @@ class Config:
     temperature: float = 0.7
     max_tokens: int = 4096
     # 记忆
-    data_dir: str = "~/AIChat_Data"
+    data_dir: str = ""  # 空 → 自动解析为 <workspace>/chat
     summarize_threshold: int = 10  # 每 N 条触发树形归纳
     working_memory_max: int = 50
     working_memory_tokens: int = 8000
@@ -26,33 +49,12 @@ class Config:
     default_adapter: str = "generic"
 
     def __post_init__(self):
-        old = Path(str(Path("~/.aichat").expanduser()))
-        self.data_dir = str(Path(self.data_dir).expanduser())
-        # 从老的隐藏目录 ~/.aichat 一次性迁移数据到新的显式目录（只跑一次）
-        try:
-            _new = Path(self.data_dir)
-            _mig_flag = _new / "_migrated_from_dot_aichat"
-            if old.exists() and old.is_dir() and not _mig_flag.exists():
-                _new.mkdir(parents=True, exist_ok=True)
-                for _src in old.iterdir():
-                    _dst = _new / _src.name
-                    try:
-                        if _src.is_dir() and not _dst.exists():
-                            shutil.copytree(_src, _dst, dirs_exist_ok=True)
-                        elif _src.is_file() and not _dst.exists():
-                            shutil.copy2(_src, _dst)
-                    except Exception:
-                        pass
-                try:
-                    _mig_flag.write_text("migration done", encoding="utf-8")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # 数据目录统一由工作区决定，旧配置里的 data_dir 一律忽略
+        self.data_dir = str(_workspace_chat_dir())
 
     def save(self, path: str | Path | None = None) -> None:
         if path is None:
-            path = Path(self.data_dir) / "config.json"
+            path = _default_config_path()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         # 合并 dataclass 字段 + 额外 dict 风格属性（last_nf_project 等）
@@ -64,22 +66,26 @@ class Config:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
-        if path is None:
-            path = Path("~/AIChat_Data/config.json").expanduser()
-        path = Path(path)
-        if path.exists():
+        if path is not None:
+            candidates = [Path(path)]
+        else:
+            candidates = [_default_config_path()]
+            legacy = Path(LEGACY_CONFIG).expanduser()
+            if legacy.exists():
+                candidates.append(legacy)  # 首次升级：读一次旧配置，不复制数据
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                # 已知字段走 dataclass 构造
-                known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-                obj = cls(**known)
-                # 额外字段（last_nf_project 等）直接 setattr
-                for k, v in data.items():
-                    if k not in cls.__dataclass_fields__:
-                        setattr(obj, k, v)
-                return obj
-            except Exception:
-                pass
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                continue
+            known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
+            obj = cls(**known)
+            for k, v in data.items():
+                if k not in cls.__dataclass_fields__:
+                    setattr(obj, k, v)
+            return obj
         return cls()
 
     # ---- dict 兼容（widgets/main_window.py 用了 config.get / config["xxx"]）----

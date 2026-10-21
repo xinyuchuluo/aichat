@@ -116,43 +116,13 @@ class Session:
         )
 
 
-@dataclass
-class MemoryRecord:
-    """一条原始记忆记录（对应 SQLite raw_text 行）。"""
-    uuid: str = field(default_factory=lambda: uuid.uuid4().hex)
-    session_id: str = ""
-    content: str = ""           # 原始文本，只追加不修改
-    role: str = ""              # user / assistant / system / tool
-    scope: str = ""             # 适配器定义的命名空间（如 novelforge:大苍界）
-    metadata: dict[str, Any] = field(default_factory=dict)
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    is_expired: bool = False    # 过期标记，不物理删除
-    # 关联的树节点 UUID（异步填充）
-    tree_node_id: str | None = None
-
-
-@dataclass
-class MemoryQuery:
-    """记忆检索请求。"""
-    query: str
-    session_id: str = ""
-    scope: str = ""
-    top_k: int = 10
-    # metadata 过滤条件
-    filters: dict[str, Any] = field(default_factory=dict)
-    # 是否需要回查原始文本
-    fetch_raw: bool = True
-
-
-@dataclass
-class MemoryResult:
-    """记忆检索结果项。"""
-    uuid: str
-    content: str           # 从 SQLite 回查的原始文本
-    score: float = 0.0     # rerank 分数
-    metadata: dict[str, Any] = field(default_factory=dict)
-    scope: str = ""
-    timestamp: str = ""
+# 记忆数据类型统一由内核 core.memory 定义，域只做引用，
+# 保证 chat 与外部软件（MCP / 导入器）看到同一套契约。
+from core.memory.types import (  # noqa: E402
+    MemoryQuery,
+    MemoryRecord,
+    MemoryResult,
+)
 
 
 @dataclass

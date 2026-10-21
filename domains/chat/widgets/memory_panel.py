@@ -194,30 +194,21 @@ class MemoryPanel(QWidget):
                 lbl.setText(lbl.text().split(":")[0] + f": {val}")
 
             if stats.get("vector_available"):
-                self._vector_status.setText("▸ 向量库 VECTOR: ONLINE (ChromaDB)")
+                self._vector_status.setText("▸ 向量库 VECTOR: ONLINE (sqlite-vec/numpy)")
                 self._vector_status.setStyleSheet(_mem_styles()["vec_on"])
             else:
-                self._vector_status.setText("▸ 向量库 VECTOR: OFFLINE (未安装 ChromaDB)")
+                self._vector_status.setText("▸ 向量库 VECTOR: OFFLINE (FTS5 关键词双路兜底)")
                 self._vector_status.setStyleSheet(_mem_styles()["vec_off"])
 
             # 刷新树视图
             self._tree.clear()
-            # 遍历所有 scope 的树节点
-            from ..memory.tree_store import TreeMemoryStore
+            from core.memory import TreeMemoryStore
             tree_store: TreeMemoryStore = self._memory.tree
-            # 获取所有 scope
-            import sqlite3
-            conn = sqlite3.connect(tree_store._db_path)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT DISTINCT scope FROM tree_nodes WHERE scope != ''").fetchall()
-            for row in rows:
-                scope = row["scope"]
+            for scope in tree_store.list_scopes():
                 scope_item = QTreeWidgetItem([scope, "scope", "", ""])
                 scope_item.setForeground(0, Qt.GlobalColor.cyan)
                 self._tree.addTopLevelItem(scope_item)
-                # 获取该 scope 的节点
-                nodes = tree_store.get_by_scope(scope)
-                for node in nodes:
+                for node in tree_store.get_by_scope(scope):
                     summary_preview = node.summary[:60] + ("..." if len(node.summary) > 60 else "")
                     item = QTreeWidgetItem([
                         node.node_id[:8],
@@ -226,7 +217,6 @@ class MemoryPanel(QWidget):
                         str(len(node.raw_uuids)),
                     ])
                     scope_item.addChild(item)
-            conn.close()
         except Exception:
             pass
 

@@ -140,7 +140,7 @@ from ..protocol.types import Message, ChatRole, Session
 from ..session.agent import ChatAgent
 from ..session.worker import ChatWorker
 from ..session.session import SessionManager
-from ..memory.engine import MemoryEngine
+from core.memory import MemoryEngine
 from ..adapters import get_adapter, list_adapters
 from .chat_view import ChatView
 from .session_sidebar import SessionSidebar
@@ -449,7 +449,7 @@ class MainWindow(QMainWindow):
             self._sidebar.refresh_sessions(self._sessions.all_sessions(), session.id)
             self._chat_view.load_messages(session.messages)
             self._session_title.setText(session.title)
-            self._status.showMessage(f"已切换到: {session.title}（已恢复工作记忆 {{len(session.messages)}} 条）")
+            self._status.showMessage(f"已切换到: {session.title}（已恢复工作记忆 {len(session.messages)} 条）")
 
     def _on_session_deleted(self, session_id: str):
         self._sessions.delete(session_id)
@@ -891,10 +891,10 @@ class MainWindow(QMainWindow):
         api_key_edit.setMinimumHeight(40)
         api_key_edit.setStyleSheet(
             "QLineEdit {"
-            f" background:{{'#ffffff' if is_light_theme() else '#0a0f20'}}; color:{col.text};"
+            f" background:{'#ffffff' if is_light_theme() else '#0a0f20'}; color:{col.text};"
             f" border: 2px solid {col.overlay}; border-radius: 10px; padding: 8px 96px 8px 14px;"
             " font-size: 14px; font-weight: 600; }"
-            f" QLineEdit:focus {{{{{{{{{{{{ border: 2px solid {col.accent}; }}}}"
+            f" QLineEdit:focus {{ border: 2px solid {col.accent}; }}"
         )
         show_btn = QPushButton("👁 显示")
         show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -902,10 +902,10 @@ class MainWindow(QMainWindow):
         show_btn.setCheckable(True)
         show_btn.setStyleSheet(
             "QPushButton {"
-            f" background:{{'#ffffff' if is_light_theme() else '#121a36'}}; color:{col.accent};"
+            f" background:{'#ffffff' if is_light_theme() else '#121a36'}; color:{col.accent};"
             f" border: 1px solid {col.overlay}; border-radius: 7px;"
             " padding: 4px 10px; font-size: 12px; font-weight: 800; min-width: 80px; }"
-            f" QPushButton:hover {{{{{{{{{{{{ color:{col.text}; border-color:{col.accent}; background:{col.surface0}; }}}}"
+            f" QPushButton:hover {{ color:{col.text}; border-color:{col.accent}; background:{col.surface0}; }}"
         )
         def _toggle_key(checked):
             if checked:
@@ -959,14 +959,14 @@ class MainWindow(QMainWindow):
             "  • 0.8 ~ 1.2：天马行空 —— 写小说、文案、头脑风暴、起名\n"
             "  • 1.3 ~ 2.0：高度发散 —— 容易出幻觉，仅适合纯创意任务"
         )
-        temp_l = QLabel(f"温度 {{self._config.temperature:.2f}}")
+        temp_l = QLabel(f"温度 {self._config.temperature:.2f}")
         temp_l.setStyleSheet(f"font-size: 13px; font-weight: 800; color:{col.text}; min-width: 76px;")
         temp_spin = QDoubleSpinBox()
         temp_spin.setRange(0.0, 2.0); temp_spin.setSingleStep(0.05); temp_spin.setDecimals(2)
         temp_spin.setValue(self._config.temperature)
         temp_spin.setStyleSheet(_spin_style())
         temp_spin.setMinimumHeight(34)
-        def _on_temp(v): temp_l.setText(f"温度 {{v:.2f}}")
+        def _on_temp(v): temp_l.setText(f"温度 {v:.2f}")
         temp_spin.valueChanged.connect(_on_temp)
         temp_row.addWidget(temp_help)
         temp_row.addWidget(temp_l)
@@ -1012,7 +1012,7 @@ class MainWindow(QMainWindow):
             cb.setStyleSheet(
                 "QCheckBox { spacing: 6px; padding: 5px 7px; border-radius: 6px; font-size: 12px;"
                 f" font-weight: 700; color:{col.text}; }}"
-                f" QCheckBox:hover {{{{{{{{{{{{ background:{col.surface0}; }}}}"
+                f" QCheckBox:hover {{ background:{col.surface0}; }}"
                 " QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 2px solid "
                 + col.overlay + "; background:"
                 + ("#ffffff" if is_light_theme() else "#0a1024") + "; }"
@@ -1085,7 +1085,7 @@ class MainWindow(QMainWindow):
                     "（兼容 OpenAI 协议的都能用）。"
                 )
             else:
-                html = f"📌 <b>{{prov_combo.currentText()}}</b><br>"
+                html = f"📌 <b>{prov_combo.currentText()}</b><br>"
                 if tip:
                     html += f"&nbsp;&nbsp;{tip}<br>"
                 if homepage:
@@ -1163,10 +1163,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "✅ 设置已保存",
                 f"LLM 配置已立即生效：\n\n"
-                f"  服务商：{{prov_combo.currentText()}}\n"
+                f"  服务商：{prov_combo.currentText()}\n"
                 f"  模型：{self._config.model}\n"
-                f"  地址：{{self._config.base_url or '(OpenAI 官方)'}}\n"
-                f"  温度：{{self._config.temperature:.2f}}  Max Tokens：{self._config.max_tokens}\n\n"
+                f"  地址：{self._config.base_url or '(OpenAI 官方)'}\n"
+                f"  温度：{self._config.temperature:.2f}  Max Tokens：{self._config.max_tokens}\n\n"
                 f"现在可以开始聊天了。"
             )
     def _rebuild_all_llm_clients(self) -> None:
@@ -1308,7 +1308,7 @@ class _SendWorker(QThread):
 
     def run(self):
         try:
-            # Step 1: 检索记忆（首次可能触发 ChromaDB 下载 onnx 模型，必须后台）
+            # Step 1: 检索记忆（FTS5 双路 + 可选向量，统一走后台线程）
             self.status_changed.emit("正在检索记忆...")
             if self._memory_results is None:
                 self._memory_results = self._agent.retrieve_memory(
@@ -1454,11 +1454,11 @@ class _SendWorker(QThread):
                     return
                 self.done.emit(final_text)
         except ImportError as e:
-            self.error.emit(f"缺少依赖: {e}。请运行 pip install openai chromadb")
+            self.error.emit(f"缺少依赖: {e}。请运行 pip install openai")
         except Exception as e:
             import traceback as _tb
             _tb.print_exc()
-            self.error.emit(f"{{type(e).__name__}}: {e}")
+            self.error.emit(f"{type(e).__name__}: {e}")
 
 
 class _SimpleLLMClient:

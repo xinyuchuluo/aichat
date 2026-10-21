@@ -1222,8 +1222,8 @@ class ChatView(QWidget):
                 unit = u
             else: break
         if unit == "B":
-            return f"{{int(s)}} B"
-        return f"{{s:.1f}} {unit}"
+            return f"{int(s)} B"
+        return f"{s:.1f} {unit}"
 
     # ---- 附件管理 ----
     def _autosize_input(self):
@@ -1283,7 +1283,7 @@ class ChatView(QWidget):
             try:
                 txt = p.read_text(encoding='utf-8', errors='replace')
                 if len(txt) > max_chars:
-                    return txt[:max_chars] + f"\n…（共 {{len(txt)}} 字，截断预览）"
+                    return txt[:max_chars] + f"\n…（共 {len(txt)} 字，截断预览）"
                 return txt
             except Exception as e:
                 return f"（读取失败：{e}）"
@@ -1297,7 +1297,7 @@ class ChatView(QWidget):
                 unit = u
             else:
                 break
-        return f"[文件：{{p.suffix.lower() or '未知类型'}}  大小：{s}{unit}]"
+        return f"[文件：{p.suffix.lower() or '未知类型'}  大小：{s}{unit}]"
 
     def _render_attachments(self):
         """把 self._attachments 渲染为可移除的 chip 列表。"""
@@ -1330,7 +1330,7 @@ class ChatView(QWidget):
                     s //= 1024
                     unit = u
                 else: break
-            label = QLabel(f"{{att['name']}} · {s}{unit}")
+            label = QLabel(f"{att['name']} · {s}{unit}")
             label.setStyleSheet("color:#9fe9ff; font-size:11px;")
             label.setToolTip(att["path"])
             close_btn = QToolButton()

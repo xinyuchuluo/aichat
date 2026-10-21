@@ -5,7 +5,7 @@ PROJECT_ROOT = os.path.abspath('.')
 a = Analysis(
     ['main.py'], pathex=[PROJECT_ROOT], binaries=[], datas=[],
     hiddenimports=[
-        'chromadb','chromadb.api','chromadb.config','openai',
+        'openai',
         'PyQt6.QtCore','PyQt6.QtGui','PyQt6.QtWidgets',
         'PyQt6.QtNetwork','PyQt6.QtPrintSupport','PyQt6.QtSql','PyQt6.QtXml',
         'numpy','numpy.core',

@@ -1552,9 +1552,14 @@ def generate_report(title: str = "数据分析报告", findings: str = "[]",
 </body>
 </html>"""
 
-    # 保存到文件
+    # 保存到文件（跟随当前工作区，禁止再写已废弃的 ~/AIChat_Data）
     da = _get_da_adapter()
-    save_dir = Path.home() / "AIChat_Data" / "reports"
+    try:
+        from core import workspace as _ws_mod
+        _ws = _ws_mod.current() or _ws_mod.ensure_default()
+        save_dir = _ws.data_path("chat") / "reports"
+    except Exception:  # noqa: BLE001
+        save_dir = Path.home() / "AichatStudio" / "default" / "chat" / "reports"
     save_dir.mkdir(parents=True, exist_ok=True)
     report_path = save_dir / f"report_{_t.strftime('%Y%m%d_%H%M%S', _t.localtime())}.html"
     try:
