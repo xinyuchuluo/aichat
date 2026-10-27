@@ -120,14 +120,25 @@ vault.get("api_profiles", default=[])
 3. 多对多强制说明（无业务原因/去重方案禁止审核）
 4. 字段术语冲突检测（同名不同义、同义不同名告警）
 
-### 1.6 graph_primitives — DAG 原语
+### 1.6 graph_primitives — 知识图库原语
 
-**职责**：DAG / 边集合 / 不变量校验。
+**职责**：通用图存储（节点 + 类型化边 + 多跳遍历），四域共用一套 `nodes` + `edges` 表，按 `domain` 字段物理隔离。原本只有边集合（DAG 原语），已升级为完整知识图库。
+
+**核心能力**：
+- `Node`（id/type/label/properties）+ `Edge`（src/dst/edge_type/properties），均支持 JSON 属性
+- 节点 CRUD：`add_node`（可指定稳定 id，如 `char:张三`）/ `get_node` / `update_node` / `remove_node` / `list_nodes(type)` / `find_nodes(label)`
+- 遍历：`neighbors(vertex, direction, edge_types)`（一层邻居，默认去重不含自身）、`traverse(start, max_depth, direction)`（**递归 CTE 多跳**，零依赖）、`subgraph(starts, max_depth)`（提取子图用于可视化/导出）
+- 不变量校验：`has_cycle` / `topological_order`（向后兼容 DAG 用法）
 
 **复用场景**：
 - studio 域：`shot_asset_link`（分镜↔资产关联）
 - novel 域：`depends_on`（章节依赖）
 - warehouse 域：表血缘 DAG（Source→ODS→DWD→DWS→ADS）
+
+**各域未来接入点（待实施）**：
+- novel 域：把实体档案（人物/地点/物品/事件）从纯 RAG 向量升级为**实体关系图**，支撑关系问答与一致性校验（`neighbors` / `traverse` 直接可用）
+- warehouse 域：血缘 DAG 升级为**带属性/类型的血缘图**（节点=表/字段，边=血缘）
+- 跨域：用稳定节点 id 把各域实体连成一张**跨域知识图**，全局检索
 
 ### 1.7 vector_spi — 向量 SPI
 
