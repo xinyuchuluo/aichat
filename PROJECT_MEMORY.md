@@ -30,7 +30,7 @@
 
 - 项目：AIChat Studio（`aichat-studio-48d2e7`）
 - 路径：`/Users/chenzhichao/AIChat`
-- 最近更新：2026-10-27 11:35
+- 最近更新：2026-10-27 15:50
 
 ### 当前有效事实
 - [事实] 向量放弃 ChromaDB（Win 上 C++ 依赖不稳），改 core/vector_spi.py 三级降级 sqlite-vec → numpy → BM25（2026-10-27 11:53）
@@ -38,6 +38,7 @@
 - [事实] 域边界铁律：内核不许 import 域、域只许 import 内核、域之间禁止互相 import；提示词放 prompts/<domain>/*.j2 不进 .py；LLM 产出必须 proposal_gate → 闸门 → 权威落库（2026-10-27 11:53）
 
 ### 最近决策与变更
+- 2026-10-27 15:50 [决策] AIChat 未提交改动按三组落地（仅本地、未 push）：97efc60 知识图库原语、3ad037c credential_hub、b42b436 MemSync（含 AGENTS.md + PROJECT_MEMORY.md + core/memory 四个新模块 + scripts）。.trae/ 仍未跟踪。（来源：trae）
 - 2026-10-27 11:35 [决策] Trae 通过 MCP 写入的一条真实决策（来源：trae）
 - 2026-10-27 11:32 [决策] 将记忆内核统一为 MemSync 档案模式 — 个人项目走 ~/AichatStudio/_memory/personal/，公司项目走 company/，AIChat/Trae/Codex/WorkBuddy 共享同一份 SQLite（来源：trae）
 <!-- memsync:auto:end -->
