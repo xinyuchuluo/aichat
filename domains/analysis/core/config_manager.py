@@ -13,6 +13,9 @@ import os
 import json
 from pathlib import Path
 
+# 统一凭证：API Key 只存 aichat 工作区 vault，analysis 不再各存
+from core.credential_hub import get_api_profiles, set_api_profiles
+
 CONFIG_DIR = Path.home() / ".data_analyst"
 CONFIG_FILE = CONFIG_DIR / "config.enc"
 KEY_FILE = CONFIG_DIR / "secret.key"
@@ -29,23 +32,38 @@ def _get_fernet():
 
 
 def save_config(config: dict):
-    """保存配置（加密）"""
+    """保存配置（加密）。api_profiles（凭证）统一写 vault，本地不再存 key。"""
+    profiles = config.get("api_profiles", []) or []
+    try:
+        set_api_profiles(profiles)
+    except Exception:
+        pass
+    # 本地只存非凭证部分（步骤映射、output_dir 等）
+    local = {k: v for k, v in config.items() if k != "api_profiles"}
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     f = _get_fernet()
-    encrypted = f.encrypt(json.dumps(config, ensure_ascii=False).encode())
+    encrypted = f.encrypt(json.dumps(local, ensure_ascii=False).encode())
     CONFIG_FILE.write_bytes(encrypted)
 
 
 def load_config() -> dict:
-    """读取配置（解密）"""
-    if not CONFIG_FILE.exists():
-        return {}
+    """读取配置（解密）。api_profiles（凭证）优先取自统一 vault。"""
+    local: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            f = _get_fernet()
+            decrypted = f.decrypt(CONFIG_FILE.read_bytes())
+            local = json.loads(decrypted.decode())
+        except Exception:
+            local = {}
+    # 统一凭证：vault 的 api_profiles 优先（vault 为空则保留本地/默认）
     try:
-        f = _get_fernet()
-        decrypted = f.decrypt(CONFIG_FILE.read_bytes())
-        return json.loads(decrypted.decode())
+        _vault_profiles = get_api_profiles()
     except Exception:
-        return {}
+        _vault_profiles = []
+    if _vault_profiles:
+        local["api_profiles"] = _vault_profiles
+    return local
 
 
 # ── 默认配置（v2：命名接口配置模式）─────────────────────────────

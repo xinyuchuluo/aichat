@@ -53,6 +53,10 @@ def main() -> int:
     # 内核单例初始化
     try:
         vault = config_vault.for_workspace(ws.root)
+        # 统一凭证：把旧位置（novel 明文 / analysis enc）的 key 并入 vault（幂等）
+        from core import credential_hub
+
+        credential_hub.ensure_migrated()
         profiles_data = vault.get("api_profiles", [])
         routing_data = vault.get("step_routing", {})
         from core.llm_client import LLMProfile

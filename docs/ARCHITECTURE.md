@@ -314,6 +314,29 @@ Mac 命中 PingFang SC，Win 命中 Microsoft YaHei。
 
 **蓝本**：NovelForge 已有的 proposal + power_canon + task_cards.json 是同构实现。
 
+## 7. 密钥统一管理（凭证中心）
+
+API Key 全系统唯一来源 = 工作区 vault（`core/config_vault`，AES Fernet）。
+
+**原三套独立存储（已统一）：**
+| 来源 | 旧位置 | 现状 |
+|---|---|---|
+| AIChat 壳 | `<ws>/config.enc` | 已是 vault |
+| NovelForge | `domains/.novelforge/config.json`（明文 api_key） | 改读 vault，本地 api_key 留空 |
+| data-analyst | `~/.data_analyst/config.enc` | 改读 vault，本地 enc 移除 api_profiles |
+
+**核心模块 `core/credential_hub.py`（属于 core，严禁 import domains）：**
+- `get/set_api_profiles()`：凭证读写，落 `<default_ws>/config.enc`。
+- `get/set_step_routing()`：步骤级路由（可选集中）。
+- `ensure_migrated()`：幂等迁移——vault 空时收集旧位置 key（novel 明文 / analysis enc 内联解密，不依赖 domains），去重写入并备份 `.bak`；`main.py` 启动自动调用。
+
+**各域接入方式：**
+- chat：壳内 `main.py` 经 `config_vault` + `llm_client.init` 已统一。
+- novel：`config.py` 的 `Config.load()` 优先用 vault endpoints；`Config.save()` 把 endpoints 写 vault、本地明文 api_key 留空。设置弹窗（`settings_dialog`）无需改动。
+- analysis：`config_manager.load/save_config` 合并/拆分 api_profiles 到 vault；GUI 内存模型不变。
+
+**纪律补充（硬约束）**：任何新域/独立软件需要 LLM，凭证一律走 `credential_hub`，不得自建明文或独立 enc。
+
 ## 6. 内核纪律（硬约束）
 
 ```

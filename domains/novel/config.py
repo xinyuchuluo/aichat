@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# 统一凭证：API Key 只存 aichat 工作区 vault，novel 不再各存明文
+from core.credential_hub import get_api_profiles, set_api_profiles
+
 _DEFAULT_CONFIG = {
     "endpoints": [],
     "default_chat_model": "",
@@ -177,10 +180,30 @@ class Config:
             skin=data.get("skin", "mocha"),
             config_dir=config_dir,
         )
+
+        # 统一凭证：endpoints（含 api_key）优先取自 aichat 工作区 vault；
+        # vault 为空才回退本地明文（迁移过渡期）。其余调参仍用本地。
+        try:
+            _vault_profiles = get_api_profiles()
+        except Exception:
+            _vault_profiles = []
+        if _vault_profiles:
+            cfg.endpoints = [LLMEndpoint.from_dict(p) for p in _vault_profiles]
+
         return cfg
 
     def save(self) -> None:
-        """保存配置到 ~/.novelforge/config.json。"""
+        """保存配置。
+
+        凭证（endpoints 含 api_key）统一写 aichat 工作区 vault；本地只存非凭证调参，
+        且本地明文里的 api_key 强制留空，避免泄露。
+        """
+        # 凭证统一写 vault
+        try:
+            set_api_profiles([e.to_dict() for e in self.endpoints])
+        except Exception:
+            pass
+
         self.config_dir.mkdir(parents=True, exist_ok=True)
         config_path = self.config_dir / "config.json"
         data = {
@@ -216,6 +239,10 @@ class Config:
             "quality_auto_fix": self.quality_auto_fix,
             "skin": self.skin,
         }
+        # 本地明文不落 api_key（凭证已在 vault）
+        for _e in data.get("endpoints", []):
+            _e["api_key"] = ""
+
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 

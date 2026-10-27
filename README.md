@@ -112,6 +112,19 @@ aichat/
 
 整合前快照保留在 `~/AIChat_backup_20261016/`（含 .git 完整历史 + 工作区状态）。
 
+## 密钥统一管理（凭证中心）
+
+API Key 全系统只存一份，位于 AIChat 工作区 vault：`<workspace>/config.enc`（AES Fernet，`secret.key` 同目录）。
+
+- 原三套独立存储已统一：AIChat 壳（本就是 vault）/ NovelForge 明文 `domains/.novelforge/config.json` / data-analyst `~/.data_analyst/config.enc`。
+- 统一入口：`core/credential_hub.py` → `get/set_api_profiles`、`get/set_step_routing`、`ensure_migrated`。
+- 行为：novel 与 analysis 的 key 改从 vault 读取并写回；本地明文不再存 api_key（novel 留空、analysis 本地 enc 移除 api_profiles）。
+- 迁移：`ensure_migrated()` 幂等——vault 为空时把旧位置 key 并入并备份 `.bak`；`main.py` 首启自动触发。
+- studio / warehouse 不调 LLM，不消费 key，但同属本体系。
+- 换机：复制 `AichatStudio/<ws>/secret.key` + `config.enc`，或重新在 UI 配一次。
+
+详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#7-密钥统一管理凭证中心)。
+
 ## 相关文档
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 架构说明（core 8 服务 + shell + 5 域 + 数据流）

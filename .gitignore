@@ -26,6 +26,10 @@ config.local.json
 AIChat_Data/
 .aichat/
 
+# NovelForge 明文配置（凭证已统一到 vault，本地仅留非敏感调参，仍不入库）
+.novelforge/
+domains/.novelforge/
+
 # 旧 ChromaDB 数据（已废弃，换 sqlite-vec）
 chroma_data/
 chroma/
