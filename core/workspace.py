@@ -16,6 +16,7 @@
 
 公司机隔离：不是双安装包，是同 App + workspace.json 的 enabled_domains
 只列 ["chat", "warehouse"]，其他域目录不创建、UI 不挂载。
+记忆档案随之隔离：work/company 工作区用 company 档案，其余用 personal 档案。
 """
 
 from __future__ import annotations
@@ -29,6 +30,9 @@ from pathlib import Path
 from typing import Optional
 
 DEFAULT_DOMAINS: tuple[str, ...] = ("chat", "novel", "studio", "warehouse", "analysis")
+
+# 这些工作区视为公司环境，记忆走 company 档案（与个人档案物理隔离）
+COMPANY_WORKSPACE_IDS: frozenset[str] = frozenset({"work", "company"})
 
 
 def _home_root() -> Path:
@@ -50,6 +54,7 @@ class WorkspaceMeta:
     data_root: str = ""
     created_at: str = ""
     schema_version: int = 1
+    memory_profile: str = "personal"
 
     @classmethod
     def new(cls, wid: str, name: str, domains: Optional[list[str]] = None) -> "WorkspaceMeta":
@@ -61,6 +66,7 @@ class WorkspaceMeta:
             data_root=str(root),
             created_at=_now_iso(),
             schema_version=1,
+            memory_profile="company" if wid.lower() in COMPANY_WORKSPACE_IDS else "personal",
         )
 
     def to_dict(self) -> dict:
@@ -71,6 +77,7 @@ class WorkspaceMeta:
             "data_root": self.data_root,
             "created_at": self.created_at,
             "schema_version": self.schema_version,
+            "memory_profile": self.memory_profile,
         }
 
     @classmethod
@@ -82,6 +89,10 @@ class WorkspaceMeta:
             data_root=d.get("data_root", ""),
             created_at=d.get("created_at", ""),
             schema_version=d.get("schema_version", 1),
+            memory_profile=d.get(
+                "memory_profile",
+                "company" if str(d.get("id", "")).lower() in COMPANY_WORKSPACE_IDS else "personal",
+            ),
         )
 
 

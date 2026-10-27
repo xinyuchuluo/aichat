@@ -16,6 +16,17 @@
 ## 标准工作流程（Agent 操作闭环）
 > 任何 coding agent 接手本仓库，按此闭环操作，**不要跳步**。
 
+0. **先读项目简报（MemSync，跨软件共享记忆）**：用户一提起某个项目，按「先看清单、再读简报」两步：
+   - 看清单：MCP `mem_projects`（= CLI `python3 scripts/memsync.py projects`）→ `project_id / 显示名 / 别名 / 记忆条数`
+   - 读简报：MCP `mem_project_brief(ref="显示名或别名")`（= CLI `memsync.py brief <别名> --refresh`）
+   - **按名字查是正路**：`ref` 接受 project_id / 显示名 / 别名。**不要只拿 cwd 去 resolve**——目录不在项目内会返回
+     `registered:false`，那只是"这个目录没注册"，**不代表项目不存在**（真实事故：某工具因此判定"学习项目没注册"）。
+   - `mem_search` 只匹配记忆正文，**不匹配项目名/别名**；想按名字找项目用 `mem_projects` / `brief` / `resolve(ref=)`。
+   - 别名全局唯一：注册时若名字/别名已被别的项目占用，`register` 会直接拒绝（别再抢名；2026-10-27 起强制）。
+   - 收尾用 `mem_note(source=<工具名>)` 写回决策/坑，再刷新简报；否则别的软件看不见。
+   - ⚠️ MCP 工具清单在**连接建立时**协商：改过 `core/memory/mcp_server.py` 后，客户端必须**重连 MCP**
+     才看得到新工具（2026-10-27 新增 `mem_projects` 即属此情况）。
+
 1. **开工前先读真实代码**：定位目标文件再改，**不靠记忆**。遵循「架构约定」(§3)；若改动涉及结构/路径/约定 → **必须同步改本文档**（见第 5 步）。
 2. **改动中**：小步提交，每完成一个逻辑单元就 `commit`。
 3. **改动后必做验证（不靠代码推断）**：
@@ -48,7 +59,8 @@
   - 公司机用 chat-warehouse 分支，workspace.json 的 enabled_domains 只列 `["chat", "warehouse"]`
 - **历史坑**：旧数据目录 `~/AIChat_Data/` 已废弃（原样保留作冷备份，不迁移、不再写入）；旧 `~/.aichat/` 也废弃。**禁止再回到旧目录**。
 - 工作区目录内容：`workspace.json`、`config.enc`（AES 加密 API Key）、`secret.key`、`chat/`、`novel/`、`studio/`、`warehouse/`、`analysis/`。
-  - chat 域数据：`<workspace>/chat/memory/`（raw_memories.db / tree_memories.db / vector_index.db）、`<workspace>/chat/sessions/`（会话 JSON）、`<workspace>/chat/config.json`。
+  - chat 域数据：`<workspace>/chat/sessions/`（会话 JSON）、`<workspace>/chat/config.json`。
+  - **记忆库不再放工作区**：统一落共享档案 `~/AichatStudio/_memory/<profile>/`（personal / company 物理隔离），chat 域与 MemSync MCP/CLI 同库。首次升级会把旧 `<workspace>/chat/memory/` 的库原样接管进档案，旧目录不再写入。
 - **不入库**：`~/AichatStudio/` 整个不入库（用户数据私有）；`config.enc` 和 `secret.key` 即使复制到仓库也不入库（`.gitignore` 排除）。
 
 ## 2. 目录与模块结构（精确路径）
@@ -75,7 +87,11 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 │  │  ├─ vector.py              ← L4 向量索引（vector_spi；无 embedder 自动关闭）
 │  │  ├─ retrieve.py            ← 检索链路（FTS5 双路 + 可选向量 → 槽位覆盖 → 回查 L2）
 │  │  ├─ working.py             ← L1 工作记忆（纯内存，不参与检索排序）
-│  │  └─ engine.py              ← MemoryEngine 编排
+│  │  ├─ engine.py              ← MemoryEngine 编排
+│  │  ├─ paths.py               ← 档案路径（personal/company 物理隔离 + 旧库接管）
+│  │  ├─ project_store.py       ← projects.db 项目注册表 + cwd 最长路径匹配
+│  │  ├─ brief.py               ← PROJECT_MEMORY.md 人工段 + 自动段组装/刷新
+│  │  └─ mcp_server.py          ← MemSync MCP server（stdio JSON-RPC，只读 + 可选写入）
 │  └─ prompt_repo.py             ← 提示词仓库（Jinja2 + 版本号 + 可回滚）
 ├─ shell/                        ← 【一体化壳】
 │  ├─ __init__.py
@@ -102,6 +118,9 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 │  ├─ sync-branch.sh             ← chat-warehouse 分支同步脚本
 │  ├─ mac.spec                    ← PyInstaller Mac（待写）
 │  └─ win.spec                    ← PyInstaller Win（待写）
+├─ scripts/                      ← 独立组件启动器（不依赖 PyQt）
+│  ├─ memsync_mcp.py             ← MemSync MCP server（给 Trae / Codex / WorkBuddy 配）
+│  └─ memsync.py                 ← MemSync CLI（resolve/register/brief/note/search/timeline）
 └─ docs/                         ← 原 AIChat 文档（AICHAT_DOC.md / 启动方式速查 / 等）
 ```
 - **import 根 = 项目根目录**：`from core.xxx import ...`、`from shell.xxx import ...`、`from domains.chat.xxx import ...`。运行 `python3 main.py` 时 cwd 必须等于 `/Users/chenzhichao/AIChat`（`main.py` 已 `sys.path.insert` 兜底）。
@@ -116,7 +135,7 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 
 ### 3.1 四层记忆架构（硬约束，不可违背）
 > 实现位置：`core/memory/`（内核，不 import 任何域）。chat 域只调用，不自带记忆实现。
-> 目标：像 claude-mem 一样可被其他软件复用；对外只读检索（search / timeline / get），写入仅本 App 或导入器。
+> 目标：可被其他软件复用；只读检索（search / timeline / get）对外开放，写入仅本 App、导入器或显式授权的 MemSync。
 
 - **L1 工作记忆**：`core/memory/working.py`，每会话独立，**纯内存，无持久化**。只服务当轮上下文组装，**不参与检索排序**（近期消息不得压过长期事实）。
 - **L2 SQLite 原始真相库**：`raw_memories.db`。**`content` 只追加，永不修改**。业务事实回查必须回 L2 取原文。
@@ -126,6 +145,26 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 - **观察类型**：`observation_type` 区分 `fact/preference/entity/reminder`（状态型，写 `fact_slots` 槽位表，检索只认当前值，旧记录仍留 L2）与 `decision/bugfix/event/flow_step/chat`（时间线型，只追加）。
 - **过期机制**：用 `is_expired` 布尔标记，**不物理删除**。L2/L3/L4 三层都要同步标记。
 - **中文检索**：FTS5 `tokenize='trigram'`；老版本 SQLite 自动降级 `unicode61` 或 LIKE。
+
+### 3.1.1 MemSync：跨软件项目记忆（双轨）
+> 目的：在 AIChat / Trae / Codex / WorkBuddy 之间切换时，agent 能直接知道项目定位、已定决策与进度；**拉取式，无守护进程，不打扰写代码节奏**。
+
+- **双轨存储**：
+  - 仓库内 `PROJECT_MEMORY.md`：人工段（永不被覆盖）+ 自动段（夹在 `<!-- memsync:auto:begin/end -->` 之间，由库里事实/决策生成，≤200 行），随 git 走，跨机同步。
+  - 本地档案库：`~/AichatStudio/_memory/<profile>/`，历史与检索；同机即时共享。**不做实时协同**，跨机靠 git + 手动拷库。
+- **档案隔离**：`personal`（默认）/ `company`。`work`、`company` 工作区的 `workspace.json` 写 `"memory_profile": "company"`，公司数据不进个人档案。
+- **项目识别**：`projects.db` 注册表 + **cwd 最长路径匹配**（`project_store.resolve`）。**不在别人仓库里加识别文件**（除简报 PROJECT_MEMORY.md 外）。
+- **scope 约定**：项目记忆统一 `project:<project_id>`；chat 域仍按 adapter 生成 scope（如 `novelforge:<项目>`），全库检索不受影响。
+- **写入纪律**：只 `append`，带 `source`；同槽位（fact/preference/entity/reminder）新值覆盖旧值但旧记录留 L2。MCP 默认**只读**，启动加 `--allow-write` 才开放 `mem_note` / `mem_project_register`。
+- **MCP 工具**：`mem_project_resolve` → `mem_project_brief`（先读这两步）→ `mem_search` / `mem_timeline` / `mem_get` / `mem_note` / `mem_project_register`。
+- **客户端配置示例**（Trae / Codex / WorkBuddy 任选）：
+  ```json
+  {"mcpServers": {"memsync": {"command": "python3",
+    "args": ["/Users/chenzhichao/AIChat/scripts/memsync_mcp.py", "--allow-write"]}}}
+  ```
+  只读部署去掉 `--allow-write`；公司档案加 `--profile company`。
+- **豆包**：无 MCP / 会话接口，只走离线粘贴或导出导入（标 `import:doubao`），不做浏览器抓取。
+- **AIChat 客户端行为**：读 `PROJECT_MEMORY.md` 人工段 + 读库；聊天写 L2；自动段由 CLI/MCP 刷新，**不擅自改人工段**。优先级：人工段 > 库中最新有效事实 > 历史。
 
 ### 3.2 聊天流水线（`chat/agent.py` ChatAgent.chat）
 固定顺序，**不要乱序**：
@@ -193,7 +232,8 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 ## 6. 验证方法
 - 语法：`find /Users/chenzhichao/AIChat -name "*.py" | xargs python3 -m py_compile`
 - 启动：`cd /Users/chenzhichao/AIChat && python3 main.py`
-- 记忆链路：发一条消息 → 检查 `~/AichatStudio/<workspace>/chat/memory/raw_memories.db` 有新记录 → 凑够 `summarize_threshold` 条 → 检查同目录 `tree_memories.db` 生成节点。
+- 记忆链路：发一条消息 → 检查 `~/AichatStudio/_memory/<profile>/raw_memories.db` 有新记录 → 凑够 `summarize_threshold` 条 → 同目录 `tree_memories.db` 生成节点。旧 `<workspace>/chat/memory/` 只在首次升级时被接管，不再写入。
+- MemSync 冒烟：`python3 scripts/memsync.py register <项目>` → `resolve` 嵌套目录命中、前缀相似目录不误匹配 → `brief --refresh` 自动段含最新决策且人工段不变 → `search 中文词` 命中 → MCP 只读模式 `mem_note` 返回 `isError`。
 - 中文检索冒烟：`MemoryEngine(dir).search("中文关键词", scope="chat")` 应返回命中；状态型记忆同 `key` 只返回最新值。
 - 工具：让 AI 调 `get_system_info`，确认返回 JSON 且气泡显示 `<|tool_result|>`。
 - 记忆提取：让 AI 回复带 `<|memory| type="fact">{"content":"测试"}</|memory|>`，确认用户侧看不到该标签、且记忆库有 `[记忆·fact]` 记录。
@@ -206,6 +246,11 @@ AIChat/                          ← 仓库根（即新的一体化 App 根目�
 - `SQLiteStore.mark_expired` 曾缺 `conn.commit()` → 过期标记不生效，已补。
 - 流式消息缺 model badge/能力标签 → `finish_streaming()` 强制注入 metadata。
 - macOS TCC 沙箱：从 IDE/Terminal 启动写入外部目录报 `[Errno 1] Operation not permitted` → 引导用户从 Finder 双击 `AIChat.command` 启动；写文件用原子写（`.tmp_{pid}` → fsync → `os.replace`）。
+- **MemSync 别名被抢 → 项目"看起来没注册"**：新项目 StudyLab 注册时带了 `学习项目,学习实验室`，把 Study 的别名抢走，
+  之后 `brief 学习实验室` 指向那个零记忆的新项目，客户端就报"没找到记录"。**别名是项目定位的唯一起点，必须全局唯一**：
+  `ProjectStore.register()` 现已做冲突检测（`_name_conflicts`），CLI/MCP 都会拒绝并列出占用者。
+- **MCP `mem_project_resolve` 曾只认 cwd**：调用方不在项目目录里就得到 `registered:false`，被误读成"没注册"。
+  现已支持 `ref`（id/显示名/别名）；同时补了 `mem_projects` 列清单工具（此前只有 CLI 有 `projects`，MCP 无从发现名字）。
 
 ## 9. 密钥统一管理（凭证中心）
 

@@ -27,7 +27,9 @@ def _build_main_window():
     首次调用时初始化 Config / MemoryEngine / SessionManager，缓存 MainWindow 实例。
     同一工作区内复用缓存；切换工作区后数据源变了，自动重建。
 
-    记忆内核来自 core.memory（与具体域解耦），数据落 <workspace>/chat/memory/。
+    记忆内核来自 core.memory（与具体域解耦），数据落共享档案
+    ~/AichatStudio/_memory/<profile>/，与 MemSync MCP / CLI 同库。
+    首次升级会把旧 <workspace>/chat/memory/ 的库原样接管进来。
     """
     global _main_window, _main_window_root
 
@@ -45,6 +47,7 @@ def _build_main_window():
     from pathlib import Path
 
     from core.memory import MemoryEngine
+    from core.memory.paths import resolve_profile
     from domains.chat.config import Config
     from domains.chat.session.session import SessionManager
     from domains.chat.widgets.main_window import MainWindow
@@ -52,7 +55,9 @@ def _build_main_window():
     config = Config.load()
     config.save()
     chat_dir = Path(config.data_dir)
-    memory = MemoryEngine(chat_dir / "memory")
+    profile = resolve_profile(getattr(ws.meta, "memory_profile", "") or "")
+    profile.import_legacy(chat_dir / "memory")
+    memory = MemoryEngine(profile.root)
     memory.set_summarize_threshold(config.summarize_threshold)
     sessions = SessionManager(chat_dir / "sessions")
 

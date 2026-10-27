@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -71,13 +72,27 @@ class RawStore:
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _init_db(self) -> bool:
-        with self._conn() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(SCHEMA)
-            fts = self._create_fts(conn)
+        # journal_mode 切换需要独占锁，多进程并发首次初始化时可能冲突
+        # —— 包在重试循环里；WAL 一旦生效后续连接不会再触发切换。
+        fts = False
+        for attempt in range(20):
+            try:
+                with self._conn() as conn:
+                    current = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                    if current != "wal":
+                        conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")  # WAL 下安全且更快
+                    conn.executescript(SCHEMA)
+                    fts = self._create_fts(conn)
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 19:
+                    raise
+                time.sleep(0.05)
         return fts
 
     @staticmethod
